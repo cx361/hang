@@ -1,0 +1,6 @@
+framework module h3_flutter {
+  umbrella header "h3_flutter-umbrella.h"
+
+  export *
+  module * { export * }
+}

@@ -1,0 +1,67 @@
+PODS:
+  - app_links (7.0.0):
+    - Flutter
+  - background_fetch (1.6.1):
+    - Flutter
+    - TSBackgroundFetch (~> 4.1.0)
+  - CocoaLumberjack (3.8.5):
+    - CocoaLumberjack/Core (= 3.8.5)
+  - CocoaLumberjack/Core (3.8.5)
+  - Flutter (1.0.0)
+  - flutter_background_geolocation (4.18.3):
+    - CocoaLumberjack (~> 3.8.5)
+    - Flutter
+  - h3_flutter (0.7.0):
+    - Flutter
+    - FlutterMacOS
+  - shared_preferences_foundation (0.0.1):
+    - Flutter
+    - FlutterMacOS
+  - TSBackgroundFetch (4.1.1)
+  - url_launcher_ios (0.0.1):
+    - Flutter
+
+DEPENDENCIES:
+  - app_links (from `.symlinks/plugins/app_links/ios`)
+  - background_fetch (from `.symlinks/plugins/background_fetch/ios`)
+  - Flutter (from `Flutter`)
+  - flutter_background_geolocation (from `.symlinks/plugins/flutter_background_geolocation/ios`)
+  - h3_flutter (from `.symlinks/plugins/h3_flutter/darwin`)
+  - shared_preferences_foundation (from `.symlinks/plugins/shared_preferences_foundation/darwin`)
+  - url_launcher_ios (from `.symlinks/plugins/url_launcher_ios/ios`)
+
+SPEC REPOS:
+  trunk:
+    - CocoaLumberjack
+    - TSBackgroundFetch
+
+EXTERNAL SOURCES:
+  app_links:
+    :path: ".symlinks/plugins/app_links/ios"
+  background_fetch:
+    :path: ".symlinks/plugins/background_fetch/ios"
+  Flutter:
+    :path: Flutter
+  flutter_background_geolocation:
+    :path: ".symlinks/plugins/flutter_background_geolocation/ios"
+  h3_flutter:
+    :path: ".symlinks/plugins/h3_flutter/darwin"
+  shared_preferences_foundation:
+    :path: ".symlinks/plugins/shared_preferences_foundation/darwin"
+  url_launcher_ios:
+    :path: ".symlinks/plugins/url_launcher_ios/ios"
+
+SPEC CHECKSUMS:
+  app_links: a754cbec3c255bd4bbb4d236ecc06f28cd9a7ce8
+  background_fetch: 858ab7f1d2f525e90808445a8d40dfdc33660aff
+  CocoaLumberjack: 6a459bc897d6d80bd1b8c78482ec7ad05dffc3f0
+  Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
+  flutter_background_geolocation: 81f17ef8f561dba232729c46275de1dbdfa89e06
+  h3_flutter: a7af78474210b8d5e59ff9e4539ecfc1ea143706
+  shared_preferences_foundation: 7036424c3d8ec98dfe75ff1667cb0cd531ec82bb
+  TSBackgroundFetch: 18918b6449a1e3f01eb0f5b44d6d79ce6160a5a5
+  url_launcher_ios: 7a95fa5b60cc718a708b8f2966718e93db0cef1b
+
+PODFILE CHECKSUM: 4053427aeb3f71b6ae3881e31630fc3938725fac
+
+COCOAPODS: 1.16.2
