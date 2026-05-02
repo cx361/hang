@@ -9,12 +9,13 @@ export PATH="$PATH:$HOME/flutter/bin"
 ln -sf $HOME/flutter/bin/flutter /usr/local/bin/flutter
 ln -sf $HOME/flutter/bin/dart /usr/local/bin/dart
 
-# Pre-cache iOS engine artifacts (required before pod install)
+# Pre-cache iOS engine artifacts
 flutter precache --ios
 
-# Get Flutter dependencies and generate Generated.xcconfig
+# Build Flutter iOS (--no-codesign = no device needed)
+# This generates Generated.xcconfig and all required Flutter build artifacts
 cd $CI_PRIMARY_REPOSITORY_PATH
-flutter pub get
+flutter build ios --release --no-codesign
 
 # Install CocoaPods dependencies
 cd ios
