@@ -442,6 +442,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
     return Scaffold(
       backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        elevation: 0,
+        title: const Text(
+          'settings.',
+          style: TextStyle(
+            color: Colors.white,
+            fontSize: 26,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+      ),
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
           : ListView(
@@ -572,7 +584,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                   trailing: Switch(
                     value: _isIncognito,
-                    activeColor: Colors.deepPurple,
+                    activeThumbColor: Colors.deepPurple,
                     onChanged: (value) {
                       if (value) {
                         _showIncognitoDialog();

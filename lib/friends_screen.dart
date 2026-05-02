@@ -407,6 +407,18 @@ class _FriendsScreenState extends State<FriendsScreen>
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        elevation: 0,
+        title: const Text(
+          'friends.',
+          style: TextStyle(
+            color: Colors.white,
+            fontSize: 26,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+      ),
       body: Column(
         children: [
           Material(
@@ -454,7 +466,7 @@ class _FriendsScreenState extends State<FriendsScreen>
             padding: const EdgeInsets.all(16),
             margin: const EdgeInsets.all(16),
             decoration: BoxDecoration(
-              color: Colors.deepPurple.withOpacity(0.2),
+              color: Colors.deepPurple.withValues(alpha: 0.2),
               border: Border.all(color: Colors.deepPurple, width: 2),
               borderRadius: BorderRadius.circular(12),
             ),
@@ -512,7 +524,7 @@ class _FriendsScreenState extends State<FriendsScreen>
               ),
               filled: true,
               fillColor: _isIncognito
-                  ? Colors.deepPurple.withOpacity(0.1)
+                  ? Colors.deepPurple.withValues(alpha: 0.1)
                   : Colors.grey[900],
               border: OutlineInputBorder(
                 borderRadius: BorderRadius.circular(12),
@@ -524,7 +536,7 @@ class _FriendsScreenState extends State<FriendsScreen>
                 borderRadius: BorderRadius.circular(12),
                 borderSide: _isIncognito
                     ? BorderSide(
-                        color: Colors.deepPurple.withOpacity(0.5),
+                        color: Colors.deepPurple.withValues(alpha: 0.5),
                         width: 1,
                       )
                     : BorderSide.none,

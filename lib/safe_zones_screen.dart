@@ -145,6 +145,18 @@ class _SafeZonesScreenState extends State<SafeZonesScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        elevation: 0,
+        title: const Text(
+          'safe zones.',
+          style: TextStyle(
+            color: Colors.white,
+            fontSize: 26,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+      ),
       body: Column(
         children: [
           // Info Banner
@@ -152,9 +164,9 @@ class _SafeZonesScreenState extends State<SafeZonesScreen> {
             padding: const EdgeInsets.all(16),
             margin: const EdgeInsets.all(16),
             decoration: BoxDecoration(
-              color: const Color(0xFF4DD0E1).withOpacity(0.1),
+              color: const Color(0xFF4DD0E1).withValues(alpha: 0.1),
               border: Border.all(
-                color: const Color(0xFF4DD0E1).withOpacity(0.3),
+                color: const Color(0xFF4DD0E1).withValues(alpha: 0.3),
               ),
               borderRadius: BorderRadius.circular(12),
             ),
@@ -384,8 +396,8 @@ class _AddSafeZoneScreenState extends State<_AddSafeZoneScreen> {
             child: Container(
               padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
-                color: Colors.blue.withOpacity(0.1),
-                border: Border.all(color: Colors.blue.withOpacity(0.3)),
+                color: Colors.blue.withValues(alpha: 0.1),
+                border: Border.all(color: Colors.blue.withValues(alpha: 0.3)),
                 borderRadius: BorderRadius.circular(8),
               ),
               child: Row(
@@ -436,10 +448,9 @@ class _AddSafeZoneScreenState extends State<_AddSafeZoneScreen> {
                       polygons: _hexagonPolygons.entries.map((entry) {
                         return Polygon(
                           points: entry.value,
-                          color: const Color(0xFF4DD0E1).withOpacity(0.4),
+                          color: const Color(0xFF4DD0E1).withValues(alpha: 0.4),
                           borderColor: const Color(0xFF4DD0E1),
                           borderStrokeWidth: 3,
-                          isFilled: true,
                         );
                       }).toList(),
                     ),
@@ -453,7 +464,7 @@ class _AddSafeZoneScreenState extends State<_AddSafeZoneScreen> {
             Container(
               width: double.infinity,
               padding: const EdgeInsets.all(16),
-              color: const Color(0xFF4DD0E1).withOpacity(0.1),
+              color: const Color(0xFF4DD0E1).withValues(alpha: 0.1),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [

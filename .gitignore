@@ -1,3 +1,6 @@
+# Secrets
+assets/.env
+
 # Miscellaneous
 *.class
 *.log

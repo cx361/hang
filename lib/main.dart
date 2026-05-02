@@ -12,6 +12,8 @@ import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'glow_wave_overlay.dart';
 import 'auth_wrapper.dart';
 import 'friends_screen.dart';
+import 'onboarding_screen.dart';
+import 'proximity_service.dart';
 import 'settings_screen.dart';
 
 Future<void> main() async {
@@ -67,7 +69,9 @@ Future<void> main() async {
   // Initialize Supabase if credentials are available
   await _initializeSupabase();
 
-  runApp(const MaterialApp(home: AuthWrapper()));
+  runApp(
+    const MaterialApp(debugShowCheckedModeBanner: false, home: AppEntry()),
+  );
 }
 
 Future<void> _initializeSupabase() async {
@@ -103,6 +107,67 @@ Future<void> _initializeSupabase() async {
   }
 }
 
+// ─── App entry point: decides onboarding vs. auth ────────────────────────────
+// DEBUG RULE: always show onboarding unless the user is already logged in.
+class AppEntry extends StatefulWidget {
+  const AppEntry({super.key});
+  @override
+  State<AppEntry> createState() => _AppEntryState();
+}
+
+class _AppEntryState extends State<AppEntry> {
+  bool _loading = true;
+  bool _showOnboarding = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _decide();
+  }
+
+  Future<void> _decide() async {
+    // If already authenticated, skip onboarding entirely.
+    final session = Supabase.instance.client.auth.currentSession;
+    if (session != null) {
+      if (mounted) {
+        setState(() {
+          _showOnboarding = false;
+          _loading = false;
+        });
+      }
+      return;
+    }
+    // Not logged in → always show onboarding (DEBUG: ignore shared_prefs flag).
+    if (mounted) {
+      setState(() {
+        _showOnboarding = true;
+        _loading = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) {
+      return const Scaffold(
+        backgroundColor: Colors.black,
+        body: Center(
+          child: CircularProgressIndicator(color: Color(0xFFFF8C00)),
+        ),
+      );
+    }
+    if (_showOnboarding) {
+      return OnboardingScreen(
+        onDone: () {
+          if (mounted) setState(() => _showOnboarding = false);
+        },
+      );
+    }
+    return const AuthWrapper();
+  }
+}
+
+// ─── Main app shell ───────────────────────────────────────────────────────────
 class HangApp extends StatefulWidget {
   const HangApp({super.key});
   @override
@@ -133,6 +198,8 @@ class _HangAppState extends State<HangApp> {
         selectedItemColor: const Color(0xFFFF8800),
         unselectedItemColor: Colors.grey,
         type: BottomNavigationBarType.fixed,
+        showSelectedLabels: false,
+        showUnselectedLabels: false,
         items: const [
           BottomNavigationBarItem(icon: Icon(Icons.radar), label: 'Radar'),
           BottomNavigationBarItem(icon: Icon(Icons.people), label: 'Friends'),
@@ -157,7 +224,7 @@ class _RadarTabState extends State<_RadarTab> {
   H3Index? currentH3Index;
   List<H3Index>? currentKRing;
   String sectorText = '';
-  String statusText = 'Waiting for location...';
+  String statusText = 'Loading ...';
   bool supabaseAvailable = false;
   String supabaseRawResponse = '';
   List<Map<String, dynamic>> nearbyFriends = [];
@@ -188,13 +255,23 @@ class _RadarTabState extends State<_RadarTab> {
       });
     }
 
-    _testSupabaseConnection();
+    // Check Supabase availability synchronously — already initialized in main().
+    try {
+      Supabase.instance.client;
+      supabaseAvailable = true;
+    } catch (_) {
+      supabaseAvailable = false;
+    }
     _loadIncognitoStatus();
     _loadSafeZoneStatus();
+
+    // Initialize proximity notifications (runs once per app session).
+    ProximityService.instance.initialize();
   }
 
   @override
   void dispose() {
+    bg.BackgroundGeolocation.removeListener(_onLocation);
     super.dispose();
   }
 
@@ -269,17 +346,17 @@ class _RadarTabState extends State<_RadarTab> {
       final age = DateTime.now().difference(updatedAt);
 
       if (age.inMinutes < 10) {
-        return '<10min';
+        return '<10m ago';
       } else if (age.inMinutes < 30) {
-        return '<30min';
+        return '<30m ago';
       } else if (age.inHours < 1) {
-        return '<1h';
+        return '<1h ago';
       } else if (age.inHours < 2) {
-        return '<2h';
+        return '<2h ago';
       } else if (age.inHours < 24) {
-        return '>${age.inHours}h';
+        return '${age.inHours}h ago';
       } else {
-        return '>${age.inDays}d';
+        return '${age.inDays}d ago';
       }
     } catch (e) {
       debugPrint('[location] Error parsing updated_at: $e');
@@ -310,13 +387,15 @@ class _RadarTabState extends State<_RadarTab> {
 
     bg.BackgroundGeolocation.ready(
       bg.Config(
-        desiredAccuracy: bg.Config.DESIRED_ACCURACY_HIGH,
-        distanceFilter: 150.0,
+        desiredAccuracy: bg.Config.DESIRED_ACCURACY_MEDIUM,
+        distanceFilter: 300.0,
         stopOnTerminate: false,
         startOnBoot: true,
-        debug: true,
-        logLevel: bg.Config.LOG_LEVEL_VERBOSE,
+        debug: false,
+        logLevel: bg.Config.LOG_LEVEL_OFF,
         locationAuthorizationRequest: 'Always',
+        showsBackgroundLocationIndicator: false,
+        heartbeatInterval: 60,
       ),
     ).then((bg.State state) {
       debugPrint('[location] Background geolocation ready');
@@ -330,44 +409,13 @@ class _RadarTabState extends State<_RadarTab> {
     bg.BackgroundGeolocation.onLocation(_onLocation, _onLocationError);
     bg.BackgroundGeolocation.start();
 
-    // Get current position immediately (especially important for simulator)
+    // Get current position immediately so the stream fires right away.
+    // Do NOT call _onLocation directly — the registered stream listener
+    // will handle the result, avoiding a double-fire.
     try {
-      final location = await bg.BackgroundGeolocation.getCurrentPosition();
-      _onLocation(location);
+      await bg.BackgroundGeolocation.getCurrentPosition();
     } catch (e) {
       debugPrint('[location] Failed to get current position: $e');
-      // Not critical, will wait for location updates
-    }
-  }
-
-  Future<void> _testSupabaseConnection() async {
-    // Test if Supabase is available and working
-    try {
-      final testResp = await Supabase.instance.client
-          .from('profiles')
-          .select('handle')
-          .limit(1)
-          .timeout(const Duration(seconds: 8));
-
-      debugPrint('[supabase] Connection test successful: $testResp');
-
-      if (!mounted) return;
-      setState(() {
-        supabaseAvailable = true;
-      });
-
-      // If we already have a location, check for friends now
-      if (currentKRing != null) {
-        debugPrint('[supabase] Re-checking friends with existing location');
-        _checkFriendsInKRing(currentKRing!);
-      }
-    } catch (e) {
-      debugPrint('[supabase] Connection test failed: $e');
-      if (!mounted) return;
-      setState(() {
-        supabaseAvailable = false;
-        supabaseRawResponse = 'Supabase-Verbindung fehlgeschlagen: $e';
-      });
     }
   }
 
@@ -396,6 +444,13 @@ class _RadarTabState extends State<_RadarTab> {
           statusText = 'Error in H3 calculation.';
         });
       }
+      return;
+    }
+
+    // Skip if we're already in this cell — avoids duplicate Supabase calls
+    // when start(), getCurrentPosition() and a cached event all fire at once.
+    if (cell == currentH3Index) {
+      debugPrint('[location] Same cell as before, skipping update');
       return;
     }
 
@@ -477,7 +532,7 @@ class _RadarTabState extends State<_RadarTab> {
     if (mounted) {
       setState(() {
         nearbyFriends = [];
-        statusText = 'Supabase not configured; no friends shown.';
+        statusText = 'Loading ...';
       });
     }
   }
@@ -583,9 +638,7 @@ class _RadarTabState extends State<_RadarTab> {
         return now.isAfter(until); // Only show if incognito expired
       }).toList();
 
-      debugPrint(
-        '[supabase] Found ${visibleFriends.length}/${resp.length} visible friends',
-      );
+      debugPrint('[supabase] Found ${visibleFriends.length} visible friends');
       if (!mounted) return;
 
       setState(() {
@@ -596,7 +649,7 @@ class _RadarTabState extends State<_RadarTab> {
         if (!mounted) return;
         setState(() {
           nearbyFriends = [];
-          statusText = 'No friends in kRing yet.';
+          statusText = 'No friends nearby.';
         });
         return;
       }
@@ -606,8 +659,9 @@ class _RadarTabState extends State<_RadarTab> {
         final map = Map<String, dynamic>.from(row as Map);
         final handle = map['handle'] as String?;
         final updatedAt = map['updated_at'] as String?;
+        final id = map['id'] as String?;
         if (handle != null) {
-          friends.add({'handle': handle, 'updated_at': updatedAt});
+          friends.add({'id': id, 'handle': handle, 'updated_at': updatedAt});
         }
       }
 
@@ -622,6 +676,11 @@ class _RadarTabState extends State<_RadarTab> {
           statusText = 'No friends nearby.';
         }
       });
+
+      // Trigger proximity notifications with 5 h cooldown.
+      if (friends.isNotEmpty) {
+        ProximityService.instance.checkAndPing(friends);
+      }
     } on TimeoutException catch (e, st) {
       debugPrint('[supabase] Query timeout: $e\n$st');
       if (!mounted) return;
@@ -639,7 +698,7 @@ class _RadarTabState extends State<_RadarTab> {
     }
   }
 
-  void _refreshSector() {
+  Future<void> _refreshSector() async {
     if (h3 == null) {
       if (mounted) {
         setState(() {
@@ -679,7 +738,6 @@ class _RadarTabState extends State<_RadarTab> {
   }
 
   void _setTestLocation() {
-    // Test location: Berlin, Germany
     const testLat = 52.5200;
     const testLng = 13.4050;
 
@@ -790,8 +848,25 @@ class _RadarTabState extends State<_RadarTab> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
-      body: Center(
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        elevation: 0,
+        title: const Text(
+          'hang.',
+          style: TextStyle(
+            color: Colors.white,
+            fontSize: 26,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+      ),
+      body: RefreshIndicator(
+        onRefresh: _refreshSector,
+        color: const Color(0xFFFF8C00),
+        backgroundColor: const Color(0xFF111111),
+        displacement: 60,
         child: SingleChildScrollView(
+          physics: const AlwaysScrollableScrollPhysics(),
           padding: const EdgeInsets.all(20),
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
@@ -834,7 +909,7 @@ class _RadarTabState extends State<_RadarTab> {
                             Text(
                               'Radar disabled - You are protected',
                               style: TextStyle(
-                                color: Color(0xFF4DD0E1).withOpacity(0.7),
+                                color: Color(0xFF4DD0E1).withValues(alpha: 0.7),
                                 fontSize: 13,
                               ),
                             ),
@@ -852,7 +927,7 @@ class _RadarTabState extends State<_RadarTab> {
                   padding: const EdgeInsets.all(16),
                   margin: const EdgeInsets.only(bottom: 24),
                   decoration: BoxDecoration(
-                    color: Colors.deepPurple.withOpacity(0.2),
+                    color: Colors.deepPurple.withValues(alpha: 0.2),
                     border: Border.all(color: Colors.deepPurple, width: 2),
                     borderRadius: BorderRadius.circular(12),
                   ),
@@ -956,41 +1031,43 @@ class _RadarTabState extends State<_RadarTab> {
               ],
               const SizedBox(height: 24),
               // Only show friends nearby section when not incognito and not in safe zone
-              if (!_isIncognito && !_isInSafeZone) ...[
-                if (nearbyFriends.isNotEmpty) ...[
-                  const Text(
-                    'Friends nearby',
-                    style: TextStyle(
-                      color: Colors.white70,
-                      fontSize: 16,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  ...nearbyFriends.map((friend) {
-                    final handle = friend['handle'] as String;
-                    final updatedAt = friend['updated_at'] as String?;
-                    final ageLabel = _getAgeLabel(updatedAt);
-                    return Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 4),
-                      child: Text(
-                        '@$handle ($ageLabel)',
-                        style: const TextStyle(
-                          color: Colors.orangeAccent,
-                          fontSize: 16,
-                          fontWeight: FontWeight.w600,
+              if (!_isIncognito && !_isInSafeZone && nearbyFriends.isNotEmpty)
+                ...nearbyFriends.map((friend) {
+                  final handle = friend['handle'] as String;
+                  final updatedAt = friend['updated_at'] as String?;
+                  final ageLabel = _getAgeLabel(updatedAt);
+                  return Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 6),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          '@$handle',
+                          style: const TextStyle(
+                            color: Colors.orangeAccent,
+                            fontSize: 16,
+                            fontWeight: FontWeight.w600,
+                          ),
                         ),
-                      ),
-                    );
-                  }),
-                ] else ...[
-                  const Text(
-                    'No friends nearby.',
-                    style: TextStyle(color: Colors.white70, fontSize: 14),
-                    textAlign: TextAlign.center,
-                  ),
-                ],
-              ],
+                        const SizedBox(width: 6),
+                        const Text(
+                          '•',
+                          style: TextStyle(color: Colors.white24, fontSize: 14),
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          ageLabel,
+                          style: const TextStyle(
+                            color: Colors.white38,
+                            fontSize: 13,
+                            fontWeight: FontWeight.w400,
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                }),
             ],
           ),
         ),
