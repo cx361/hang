@@ -5,6 +5,10 @@ set -e
 git clone https://github.com/flutter/flutter.git --depth 1 -b stable $HOME/flutter
 export PATH="$PATH:$HOME/flutter/bin"
 
+# Make Flutter available system-wide for Xcode build phases
+ln -sf $HOME/flutter/bin/flutter /usr/local/bin/flutter
+ln -sf $HOME/flutter/bin/dart /usr/local/bin/dart
+
 # Pre-cache iOS engine artifacts (required before pod install)
 flutter precache --ios
 
