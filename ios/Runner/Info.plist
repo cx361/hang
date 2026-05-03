@@ -24,6 +24,12 @@
 	<string>????</string>
 	<key>CFBundleVersion</key>
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
+	<key>NSMotionUsageDescription</key>
+	<string>hang nutzt Bewegungssensoren, um den Standort-Modus intelligent zu wechseln und Akku zu sparen</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>hang needs access to your photo library to set your profile picture.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>hang needs camera access to take a profile picture.</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>

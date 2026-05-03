@@ -4,6 +4,9 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+// In debug builds use a short cooldown so testing is easy.
+const _kCooldown = kDebugMode ? Duration(minutes: 1) : Duration(hours: 3);
+
 /// Handles symmetric proximity notifications between two users.
 ///
 /// When User A detects User B nearby:
@@ -19,7 +22,14 @@ class ProximityService {
   ProximityService._();
   static final ProximityService instance = ProximityService._();
 
-  static const _cooldown = Duration(hours: 5);
+  /// Optional callback that forwards log messages to the in-app debug box.
+  void Function(String)? uiLogger;
+
+  void _log(String msg) {
+    debugPrint(msg);
+    uiLogger?.call(msg.replaceFirst('[proximity] ', ''));
+  }
+
   static const _channelId = 'proximity_alerts';
   static const _channelName = 'Nearby Friends';
   static const _channelDescription = 'Alerts when friends are nearby';
@@ -49,13 +59,17 @@ class ProximityService {
       requestSoundPermission: true,
     );
 
-    await _notifications.initialize(
+    // On iOS, initialize() returns true only if notification permission is
+    // granted. Log this so we can diagnose permission issues.
+    final initResult = await _notifications.initialize(
       const InitializationSettings(
         android: androidSettings,
         iOS: appleSettings,
         macOS: appleSettings,
       ),
+      onDidReceiveNotificationResponse: (_) {},
     );
+    _log('[proximity] initialize result (permission granted): $initResult');
 
     // Android O+ requires an explicit notification channel.
     await _notifications
@@ -71,28 +85,42 @@ class ProximityService {
           ),
         );
 
-    // iOS/macOS: explicitly request permission and log the outcome.
-    // The system dialog only appears once; after that this just returns the
-    // current grant state so we can diagnose silent failures.
+    // iOS: use DarwinFlutterLocalNotificationsPlugin (replaces iOS-specific
+    // class in flutter_local_notifications v18+).
     final iosGranted = await _notifications
         .resolvePlatformSpecificImplementation<
           IOSFlutterLocalNotificationsPlugin
         >()
         ?.requestPermissions(alert: true, badge: false, sound: true);
-    debugPrint('[proximity] iOS notification permission granted: $iosGranted');
+    _log('[proximity] iOS permission granted: $iosGranted');
 
     final macGranted = await _notifications
         .resolvePlatformSpecificImplementation<
           MacOSFlutterLocalNotificationsPlugin
         >()
         ?.requestPermissions(alert: true, badge: false, sound: true);
-    debugPrint(
-      '[proximity] macOS notification permission granted: $macGranted',
-    );
+    _log('[proximity] macOS permission granted: $macGranted');
 
     _initialized = true;
     _subscribeRealtime();
-    debugPrint('[proximity] Service initialized');
+
+    // Log the actual iOS permission state so we can diagnose silent failures.
+    final iosPlugin = _notifications
+        .resolvePlatformSpecificImplementation<
+          IOSFlutterLocalNotificationsPlugin
+        >();
+    if (iosPlugin != null) {
+      final perms = await iosPlugin.checkPermissions();
+      _log(
+        '[proximity] iOS perms — isEnabled:${perms?.isEnabled} '
+        'alert:${perms?.isAlertEnabled} sound:${perms?.isSoundEnabled} '
+        'badge:${perms?.isBadgeEnabled}',
+      );
+    } else {
+      _log('[proximity] iOS plugin not resolved (non-iOS device?)');
+    }
+
+    _log('[proximity] Service initialized');
   }
 
   // ── Realtime subscription ─────────────────────────────────────────────────
@@ -122,7 +150,7 @@ class ProximityService {
           callback: (p) => _onEvent(p, userId),
         )
         .subscribe((status, [err]) {
-          debugPrint('[proximity] channel_a status: $status err: $err');
+          _log('[proximity] channel_a status: $status err: $err');
         });
 
     _channelB = db
@@ -139,7 +167,7 @@ class ProximityService {
           callback: (p) => _onEvent(p, userId),
         )
         .subscribe((status, [err]) {
-          debugPrint('[proximity] channel_b status: $status err: $err');
+          _log('[proximity] channel_b status: $status err: $err');
         });
   }
 
@@ -171,12 +199,14 @@ class ProximityService {
       final handle = (row['handle'] as String?) ?? 'Jemand';
       await _showNotification(handle);
     } catch (e) {
-      debugPrint('[proximity] Error fetching handle for notification: $e');
+      _log('[proximity] Error fetching handle: $e');
       await _showNotification('Jemand');
     }
   }
 
   Future<void> _showNotification(String handle) async {
+    // Ensure the plugin is ready even if initialize() wasn't awaited.
+    if (!_initialized) await initialize();
     const android = AndroidNotificationDetails(
       _channelId,
       _channelName,
@@ -186,10 +216,11 @@ class ProximityService {
     );
     const apple = DarwinNotificationDetails(
       presentAlert: true,
-      presentBanner:
-          true, // iOS 14+: show banner even when app is in foreground
+      presentBanner: true,
       presentBadge: false,
       presentSound: true,
+      // timeSensitive breaks through Focus/DND on iOS 15+
+      interruptionLevel: InterruptionLevel.timeSensitive,
     );
     const details = NotificationDetails(
       android: android,
@@ -198,13 +229,8 @@ class ProximityService {
     );
 
     final id = _notifId++ & 0x7FFFFFFF;
-    await _notifications.show(
-      id,
-      'hang.',
-      '$handle ist in deiner Nähe 👋',
-      details,
-    );
-    debugPrint('[proximity] Notification shown for $handle');
+    await _notifications.show(id, 'hang.', '$handle is nearby! 👋', details);
+    _log('[proximity] Notification shown for $handle');
   }
 
   // ── Ping logic ────────────────────────────────────────────────────────────
@@ -235,7 +261,7 @@ class ProximityService {
 
     final cooldownCutoff = DateTime.now()
         .toUtc()
-        .subtract(_cooldown)
+        .subtract(_kCooldown)
         .toIso8601String();
 
     try {
@@ -248,7 +274,10 @@ class ProximityService {
           .maybeSingle();
 
       if (existing != null) {
-        debugPrint('[proximity] Cooldown active for $pairKey — skipping');
+        _log(
+          '[proximity] Cooldown for $pairKey '
+          '(last: ${existing['pinged_at']})',
+        );
         return;
       }
 
@@ -263,13 +292,13 @@ class ProximityService {
         'pinged_at': DateTime.now().toUtc().toIso8601String(),
       }, onConflict: 'pair_key');
 
-      debugPrint('[proximity] Pinged pair $pairKey');
+      _log('[proximity] Pinged pair $pairKey');
 
       // Notify the local user immediately (the friend is notified via Realtime).
       await _showNotification(handle);
     } catch (e) {
       _selfTriggered.remove(pairKey);
-      debugPrint('[proximity] Error pinging pair $pairKey: $e');
+      _log('[proximity] Error pinging $pairKey: $e');
     }
   }
 

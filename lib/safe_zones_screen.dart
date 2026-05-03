@@ -72,6 +72,8 @@ class _SafeZonesScreenState extends State<SafeZonesScreen> {
           'h3_index_res9': h3IndexStr,
         });
 
+        await _reevaluateSafeZoneStatus();
+
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
@@ -90,6 +92,47 @@ class _SafeZonesScreenState extends State<SafeZonesScreen> {
           ).showSnackBar(SnackBar(content: Text('Error adding: $e')));
         }
       }
+    }
+  }
+
+  /// After deleting a safe zone, re-check whether the user's current hex is
+  /// still inside any *remaining* zone and patch profiles.is_in_safe_zone.
+  Future<void> _reevaluateSafeZoneStatus() async {
+    final userId = Supabase.instance.client.auth.currentUser?.id;
+    if (userId == null) return;
+    try {
+      // Fetch current hex and remaining safe zones sequentially (different return types).
+      final profileResp = await Supabase.instance.client
+          .from('profiles')
+          .select('last_h3_index_res9')
+          .eq('id', userId)
+          .single();
+      final remainingZones = await Supabase.instance.client
+          .from('safe_zones')
+          .select('h3_index_res9')
+          .eq('user_id', userId);
+
+      final currentHex = profileResp['last_h3_index_res9'] as String?;
+
+      bool isInSafeZone = false;
+      if (currentHex != null) {
+        for (final zone in remainingZones) {
+          final hexes = (zone['h3_index_res9'] as String).split(',');
+          if (hexes.contains(currentHex)) {
+            isInSafeZone = true;
+            break;
+          }
+        }
+      }
+
+      await Supabase.instance.client
+          .from('profiles')
+          .update({'is_in_safe_zone': isInSafeZone})
+          .eq('id', userId);
+
+      debugPrint('[safe_zones] Re-evaluated is_in_safe_zone=$isInSafeZone');
+    } catch (e) {
+      debugPrint('[safe_zones] Error re-evaluating safe zone status: $e');
     }
   }
 
@@ -123,6 +166,7 @@ class _SafeZonesScreenState extends State<SafeZonesScreen> {
     if (confirmed == true) {
       try {
         await Supabase.instance.client.from('safe_zones').delete().eq('id', id);
+        await _reevaluateSafeZoneStatus();
 
         if (mounted) {
           ScaffoldMessenger.of(
@@ -290,8 +334,8 @@ class _AddSafeZoneScreenState extends State<_AddSafeZoneScreen> {
   final _nameController = TextEditingController();
   final MapController _mapController = MapController();
   H3? _h3;
-  Set<String> _selectedH3Indices = {};
-  Map<String, List<latlong.LatLng>> _hexagonPolygons = {};
+  final Set<String> _selectedH3Indices = {};
+  final Map<String, List<latlong.LatLng>> _hexagonPolygons = {};
 
   @override
   void initState() {

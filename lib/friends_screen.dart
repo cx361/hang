@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'profile_screen.dart';
 
 class FriendsScreen extends StatefulWidget {
   const FriendsScreen({super.key});
@@ -18,7 +20,7 @@ class _FriendsScreenState extends State<FriendsScreen>
   List<Map<String, dynamic>> _friendsList = [];
   List<Map<String, dynamic>> _sentRequests = [];
 
-  bool _isSearching = false;
+  Timer? _searchDebounce;
   String? _currentUserId;
   bool _isIncognito = false;
   DateTime? _incognitoUntil;
@@ -36,6 +38,7 @@ class _FriendsScreenState extends State<FriendsScreen>
   void dispose() {
     _tabController.dispose();
     _searchController.dispose();
+    _searchDebounce?.cancel();
     super.dispose();
   }
 
@@ -163,25 +166,28 @@ class _FriendsScreenState extends State<FriendsScreen>
     }
   }
 
+  void _onSearchChanged(String query) {
+    _searchDebounce?.cancel();
+    if (query.trim().isEmpty) {
+      setState(() => _searchResults = []);
+      return;
+    }
+    _searchDebounce = Timer(const Duration(milliseconds: 350), () {
+      _searchUsers(query);
+    });
+  }
+
   Future<void> _searchUsers(String query) async {
     // Disable search when incognito
     if (_isIncognito) {
-      setState(() {
-        _searchResults = [];
-      });
+      setState(() => _searchResults = []);
       return;
     }
 
     if (query.trim().isEmpty) {
-      setState(() {
-        _searchResults = [];
-      });
+      setState(() => _searchResults = []);
       return;
     }
-
-    setState(() {
-      _isSearching = true;
-    });
 
     try {
       // Search by handle (case-insensitive)
@@ -233,15 +239,11 @@ class _FriendsScreenState extends State<FriendsScreen>
       if (mounted) {
         setState(() {
           _searchResults = results;
-          _isSearching = false;
         });
       }
     } catch (e) {
       debugPrint('[friends] Search error: $e');
       if (mounted) {
-        setState(() {
-          _isSearching = false;
-        });
         ScaffoldMessenger.of(
           context,
         ).showSnackBar(SnackBar(content: Text('Search error: $e')));
@@ -542,13 +544,11 @@ class _FriendsScreenState extends State<FriendsScreen>
                     : BorderSide.none,
               ),
             ),
-            onChanged: _searchUsers,
+            onChanged: _onSearchChanged,
           ),
         ),
         Expanded(
-          child: _isSearching
-              ? const Center(child: CircularProgressIndicator())
-              : _searchResults.isEmpty
+          child: _searchResults.isEmpty
               ? Center(
                   child: Text(
                     _isIncognito
@@ -604,6 +604,13 @@ class _FriendsScreenState extends State<FriendsScreen>
                     }
 
                     return ListTile(
+                      onTap: () => Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) =>
+                              ProfileScreen(userId: userId, handle: handle),
+                        ),
+                      ),
                       leading: CircleAvatar(
                         backgroundColor: Colors.deepOrange,
                         child: Text(
@@ -719,6 +726,15 @@ class _FriendsScreenState extends State<FriendsScreen>
         final friendshipId = friend['id'] as String;
 
         return ListTile(
+          onTap: () => Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (_) => ProfileScreen(
+                userId: friend['user_id'] as String,
+                handle: handle,
+              ),
+            ),
+          ),
           leading: CircleAvatar(
             backgroundColor: Colors.green,
             child: Text(

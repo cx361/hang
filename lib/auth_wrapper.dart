@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'auth_screen.dart';
+import 'post_signup_setup_screen.dart';
 import 'profile_setup_screen.dart';
 import 'main.dart';
 
@@ -16,6 +17,7 @@ class _AuthWrapperState extends State<AuthWrapper> {
   User? _user;
   bool _hasProfile = false;
   bool _isLoading = true;
+  bool _needsSetup = false;
 
   @override
   void initState() {
@@ -96,8 +98,19 @@ class _AuthWrapperState extends State<AuthWrapper> {
     if (!_hasProfile) {
       return ProfileSetupScreen(
         onProfileCreated: () {
-          _checkAuthState();
+          // Brand-new account: show post-signup setup before the main app.
+          setState(() {
+            _hasProfile = true;
+            _needsSetup = true;
+          });
         },
+      );
+    }
+
+    // Freshly created account → post-signup setup
+    if (_needsSetup) {
+      return PostSignupSetupScreen(
+        onDone: () => setState(() => _needsSetup = false),
       );
     }
 

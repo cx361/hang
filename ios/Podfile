@@ -1,5 +1,5 @@
 # Uncomment this line to define a global platform for your project
-platform :ios, '13.0'
+platform :ios, '14.0'
 
 # CocoaPods analytics sends network stats synchronously affecting flutter build latency.
 ENV['COCOAPODS_DISABLE_STATS'] = 'true'
@@ -42,31 +42,42 @@ post_install do |installer|
     
     target.build_configurations.each do |config|
       # Das hier stellt sicher, dass alle Pods die gleiche iOS-Version nutzen
-      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '13.0'
+      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '14.0'
       # Verhindert Fehler bei Apple Silicon Simulatoren
       config.build_settings['ONLY_ACTIVE_ARCH'] = 'YES'
     end
   end
 
+  # Fix: force-load libh3.a so all C symbols (e.g. degsToRads) are available
+  # for Dart FFI's DynamicLibrary.process() lookup at runtime.
+  #
+  # Using a helper variable H3_FORCE_LOAD avoids the bug where setting
+  # OTHER_LDFLAGS[sdk=iphoneos*] replaces the unconditional OTHER_LDFLAGS
+  # (losing -ObjC, -l"h3", all framework flags). Instead OTHER_LDFLAGS stays
+  # unconditional and expands $(H3_FORCE_LOAD) which is SDK-conditional.
   %w[Pods-Runner].each do |target_name|
     %w[debug release].each do |config_name|
       xcconfig_path = File.join(installer.sandbox.root.to_s, 'Target Support Files', target_name, "#{target_name}.#{config_name}.xcconfig")
       next unless File.exist?(xcconfig_path)
 
       contents = File.read(xcconfig_path)
-      force_load_sim = '-force_load "$(PODS_ROOT)/../.symlinks/plugins/h3_flutter/darwin/Libs/h3.xcframework/ios-arm64_x86_64-simulator/libh3.a"'
-      force_load_ios = '-force_load "$(PODS_ROOT)/../.symlinks/plugins/h3_flutter/darwin/Libs/h3.xcframework/ios-arm64/libh3.a"'
+      next if contents.include?('H3_FORCE_LOAD')
 
-      if contents.include?(force_load_sim) && contents.include?(force_load_ios)
-        next
-      end
+      # Remove old broken conditional flags if present from a previous install
+      contents = contents.gsub(/\nOTHER_LDFLAGS\[sdk=.*?\] = .*/, '')
 
+      sim_lib  = '"$(PODS_ROOT)/../.symlinks/plugins/h3_flutter/darwin/Libs/h3.xcframework/ios-arm64_x86_64-simulator/libh3.a"'
+      ios_lib  = '"$(PODS_ROOT)/../.symlinks/plugins/h3_flutter/darwin/Libs/h3.xcframework/ios-arm64/libh3.a"'
+
+      # Append the sdk-conditional helper and reference it from OTHER_LDFLAGS
       contents = contents.gsub(/^(OTHER_LDFLAGS = .*)$/) do |match|
-        out = match
-        out += "\nOTHER_LDFLAGS[sdk=iphonesimulator*] = $(inherited) #{force_load_sim}" unless contents.include?(force_load_sim)
-        out += "\nOTHER_LDFLAGS[sdk=iphoneos*] = $(inherited) #{force_load_ios}" unless contents.include?(force_load_ios)
-        out
+        <<~XCCONFIG.chomp
+          H3_FORCE_LOAD[sdk=iphoneos*] = -force_load #{ios_lib}
+          H3_FORCE_LOAD[sdk=iphonesimulator*] = -force_load #{sim_lib}
+          #{match} $(H3_FORCE_LOAD)
+        XCCONFIG
       end
+
       File.write(xcconfig_path, contents)
     end
   end

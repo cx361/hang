@@ -9,6 +9,7 @@ import 'package:flutter_background_geolocation/flutter_background_geolocation.da
 import 'package:h3_flutter/h3_flutter.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:home_widget/home_widget.dart';
 import 'glow_wave_overlay.dart';
 import 'auth_wrapper.dart';
 import 'friends_screen.dart';
@@ -68,6 +69,11 @@ Future<void> main() async {
 
   // Initialize Supabase if credentials are available
   await _initializeSupabase();
+
+  // Configure home_widget App Group so data is shared with the iOS widget.
+  if (Platform.isIOS) {
+    await HomeWidget.setAppGroupId('group.com.hangsocial.hang');
+  }
 
   runApp(
     const MaterialApp(debugShowCheckedModeBanner: false, home: AppEntry()),
@@ -176,17 +182,19 @@ class HangApp extends StatefulWidget {
 
 class _HangAppState extends State<HangApp> {
   int _currentIndex = 0;
-
-  final List<Widget> _screens = [
-    const _RadarTab(),
-    const FriendsScreen(),
-    const SettingsScreen(),
-  ];
+  final _radarKey = GlobalKey<_RadarTabState>();
 
   @override
   Widget build(BuildContext context) {
+    final screens = [
+      _RadarTab(key: _radarKey),
+      const FriendsScreen(),
+      SettingsScreen(
+        onRadiusChanged: (k) => _radarKey.currentState?.onRadiusChanged(k),
+      ),
+    ];
     return Scaffold(
-      body: _screens[_currentIndex],
+      body: IndexedStack(index: _currentIndex, children: screens),
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: _currentIndex,
         onTap: (index) {
@@ -214,7 +222,7 @@ class _HangAppState extends State<HangApp> {
 }
 
 class _RadarTab extends StatefulWidget {
-  const _RadarTab();
+  const _RadarTab({super.key});
   @override
   State<_RadarTab> createState() => _RadarTabState();
 }
@@ -231,6 +239,20 @@ class _RadarTabState extends State<_RadarTab> {
   bool _isIncognito = false;
   DateTime? _incognitoUntil;
   bool _isInSafeZone = false;
+  int _visibilityRadius = 2; // kRing (1 = ~500m, 2 = ~1.5km, 3 = ~3km)
+  bool _radiusLoaded = false;
+
+  // Debug panel
+  final List<String> _debugLog = [];
+  bool _showDebug = false;
+
+  void _dbg(String msg) {
+    final ts = DateTime.now().toLocal().toString().substring(11, 19);
+    debugPrint('[dbg] $msg');
+    _debugLog.insert(0, '[$ts] $msg');
+    if (_debugLog.length > 30) _debugLog.removeLast();
+    if (mounted) setState(() {});
+  }
 
   bool get hasNearbyFriends => nearbyFriends.isNotEmpty;
 
@@ -239,9 +261,9 @@ class _RadarTabState extends State<_RadarTab> {
     super.initState();
     try {
       h3 = const H3Factory().load();
-      debugPrint('[h3_ffi] H3 native library initialized');
+      _dbg('H3 init: OK');
     } catch (e) {
-      debugPrint('[h3_ffi] Failed to initialize H3 native library: $e');
+      _dbg('H3 init FAILED: $e');
       setState(() {
         statusText = 'H3 library could not be loaded.';
       });
@@ -264,15 +286,65 @@ class _RadarTabState extends State<_RadarTab> {
     }
     _loadIncognitoStatus();
     _loadSafeZoneStatus();
+    _loadVisibilityRadius();
+    _loadLastKnownCell();
 
     // Initialize proximity notifications (runs once per app session).
-    ProximityService.instance.initialize();
+    // Forward all proximity log messages into the in-app debug box.
+    ProximityService.instance.uiLogger = (msg) => _dbg('prox: $msg');
+    // ignore: discarded_futures
+    ProximityService.instance.initialize().catchError((e) {
+      debugPrint('[proximity] init error: $e');
+    });
   }
 
   @override
   void dispose() {
     bg.BackgroundGeolocation.removeListener(_onLocation);
     super.dispose();
+  }
+
+  // Push current state to the iOS home screen widget.
+  Future<void> _updateWidget() async {
+    await HomeWidget.saveWidgetData<int>(
+      'hang.nearbyCount',
+      nearbyFriends.length,
+    );
+    await HomeWidget.saveWidgetData<String>('hang.statusText', statusText);
+    await HomeWidget.saveWidgetData<bool>('hang.isIncognito', _isIncognito);
+    await HomeWidget.saveWidgetData<bool>('hang.isSafeZone', _isInSafeZone);
+    await HomeWidget.saveWidgetData<String>(
+      'hang.lastUpdated',
+      DateTime.now().toUtc().toIso8601String(),
+    );
+    await HomeWidget.updateWidget(iOSName: 'HangWidgetExtension');
+  }
+
+  /// Seed [currentH3Index] from the DB so the same-cell guard in [_onLocation]
+  /// prevents redundant Supabase writes after an app restart.
+  /// Only sets the value if no real GPS fix has arrived yet.
+  Future<void> _loadLastKnownCell() async {
+    if (h3 == null) return;
+    final userId = Supabase.instance.client.auth.currentUser?.id;
+    if (userId == null) return;
+    try {
+      final resp = await Supabase.instance.client
+          .from('profiles')
+          .select('last_h3_index_res9')
+          .eq('id', userId)
+          .single();
+      final hexStr = resp['last_h3_index_res9'] as String?;
+      if (hexStr != null &&
+          hexStr.isNotEmpty &&
+          mounted &&
+          currentH3Index == null) {
+        final cell = BigInt.parse(hexStr, radix: 16);
+        setState(() => currentH3Index = cell);
+        debugPrint('[location] Seeded currentH3Index from DB: $hexStr');
+      }
+    } catch (e) {
+      debugPrint('[location] Failed to seed last known cell: $e');
+    }
   }
 
   Future<void> _loadIncognitoStatus() async {
@@ -311,22 +383,69 @@ class _RadarTabState extends State<_RadarTab> {
     }
   }
 
+  Future<void> _loadVisibilityRadius() async {
+    final userId = Supabase.instance.client.auth.currentUser?.id;
+    if (userId == null) return;
+    try {
+      final resp = await Supabase.instance.client
+          .from('profiles')
+          .select('visibility_radius')
+          .eq('id', userId)
+          .single();
+      if (mounted) {
+        setState(() {
+          _visibilityRadius = (resp['visibility_radius'] as int?) ?? 2;
+          _radiusLoaded = true;
+        });
+      }
+    } catch (e) {
+      debugPrint('[radar] Error loading visibility_radius: $e');
+    }
+  }
+
+  /// Called by SettingsScreen when the user changes their visibility radius.
+  void onRadiusChanged(int k) {
+    setState(() => _visibilityRadius = k);
+    _refreshSector();
+  }
+
   Future<void> _loadSafeZoneStatus() async {
     final userId = Supabase.instance.client.auth.currentUser?.id;
     if (userId == null) return;
 
     try {
-      final resp = await Supabase.instance.client
-          .from('profiles')
-          .select('is_in_safe_zone')
-          .eq('id', userId)
-          .single();
+      // Compute fresh from the safe_zones table using the current hex.
+      // This avoids relying on the potentially stale profiles.is_in_safe_zone
+      // column (which only updates on GPS movement).
+      final hexIndex = currentH3Index?.toRadixString(16);
+
+      final zones = await Supabase.instance.client
+          .from('safe_zones')
+          .select('h3_index_res9')
+          .eq('user_id', userId);
+
+      bool isInSafeZone = false;
+      if (hexIndex != null) {
+        for (final zone in zones) {
+          final hexes = (zone['h3_index_res9'] as String).split(',');
+          if (hexes.contains(hexIndex)) {
+            isInSafeZone = true;
+            break;
+          }
+        }
+      } else {
+        // No GPS fix yet — fall back to the cached DB value.
+        final resp = await Supabase.instance.client
+            .from('profiles')
+            .select('is_in_safe_zone')
+            .eq('id', userId)
+            .single();
+        isInSafeZone = resp['is_in_safe_zone'] ?? false;
+      }
 
       if (mounted) {
         setState(() {
-          _isInSafeZone = resp['is_in_safe_zone'] ?? false;
-
-          // Clear nearby friends when in safe zone
+          _isInSafeZone = isInSafeZone;
           if (_isInSafeZone) {
             nearbyFriends.clear();
             statusText = 'Radar disabled (Safe Zone)';
@@ -387,8 +506,9 @@ class _RadarTabState extends State<_RadarTab> {
 
     bg.BackgroundGeolocation.ready(
       bg.Config(
-        desiredAccuracy: bg.Config.DESIRED_ACCURACY_MEDIUM,
-        distanceFilter: 300.0,
+        reset: true,
+        desiredAccuracy: bg.Config.DESIRED_ACCURACY_HIGH,
+        distanceFilter: 100.0,
         stopOnTerminate: false,
         startOnBoot: true,
         debug: false,
@@ -413,7 +533,11 @@ class _RadarTabState extends State<_RadarTab> {
     // Do NOT call _onLocation directly — the registered stream listener
     // will handle the result, avoiding a double-fire.
     try {
-      await bg.BackgroundGeolocation.getCurrentPosition();
+      await bg.BackgroundGeolocation.getCurrentPosition(
+        desiredAccuracy: bg.Config.DESIRED_ACCURACY_HIGH,
+        maximumAge: 0,
+        timeout: 30,
+      );
     } catch (e) {
       debugPrint('[location] Failed to get current position: $e');
     }
@@ -422,12 +546,30 @@ class _RadarTabState extends State<_RadarTab> {
   void _onLocation(bg.Location location) {
     final lat = location.coords.latitude;
     final lng = location.coords.longitude;
+    final acc = location.coords.accuracy;
+    _dbg(
+      'GPS ${lat.toStringAsFixed(5)},${lng.toStringAsFixed(5)} ±${acc.toStringAsFixed(0)}m mock=${location.mock}',
+    );
+
     if (h3 == null) {
-      debugPrint('[h3_ffi] H3 not available on location update');
+      _dbg('H3 is null — cannot process location');
+      if (mounted) setState(() => statusText = 'H3 not loaded.');
+      return;
+    }
+
+    if (lat == 0.0 && lng == 0.0) {
+      _dbg('Skipping 0,0 coordinates (no GPS fix yet)');
+      return;
+    }
+
+    const double kMinAccuracyMeters = 100.0;
+    if (acc > kMinAccuracyMeters) {
+      _dbg('Skipping low-accuracy fix: ±${acc.toStringAsFixed(0)}m');
       if (mounted) {
-        setState(() {
-          statusText = 'H3 not loaded; location not processed.';
-        });
+        setState(
+          () =>
+              statusText = 'Waiting for GPS fix (±${acc.toStringAsFixed(0)}m)…',
+        );
       }
       return;
     }
@@ -436,14 +578,11 @@ class _RadarTabState extends State<_RadarTab> {
     List<H3Index> kRingCells;
     try {
       cell = h3!.geoToCell(GeoCoord(lat: lat, lon: lng), 9);
-      kRingCells = h3!.gridDisk(cell, 2);
+      kRingCells = h3!.gridDisk(cell, _visibilityRadius);
+      _dbg('H3 OK: ${cell.toRadixString(16)}');
     } catch (e) {
-      debugPrint('[h3_ffi] Error converting location to H3: $e');
-      if (mounted) {
-        setState(() {
-          statusText = 'Error in H3 calculation.';
-        });
-      }
+      _dbg('H3 convert error: $e');
+      if (mounted) setState(() => statusText = 'H3 error: $e');
       return;
     }
 
@@ -515,11 +654,9 @@ class _RadarTabState extends State<_RadarTab> {
   }
 
   void _onLocationError(bg.LocationError error) {
-    debugPrint('[location error] - $error');
+    _dbg('Location error ${error.code}: ${error.message}');
     if (mounted) {
-      setState(() {
-        statusText = 'Location-Fehler: ${error.message}';
-      });
+      setState(() => statusText = 'Location error: ${error.message}');
     }
   }
 
@@ -614,28 +751,44 @@ class _RadarTabState extends State<_RadarTab> {
         return;
       }
 
-      // Query profiles that are friends AND in the kRing AND NOT in safe zone
+      // Query profiles that are friends AND NOT in safe zone.
+      // Also fetch visibility_radius so we can apply min-kRing (privacy wins).
       final resp = await Supabase.instance.client
           .from('profiles')
           .select(
-            'handle,last_h3_index_res9,id,updated_at,is_in_safe_zone,is_incognito,incognito_until',
+            'handle,last_h3_index_res9,id,updated_at,is_in_safe_zone,is_incognito,incognito_until,visibility_radius',
           )
-          .inFilter('last_h3_index_res9', hexesRes9)
           .inFilter('id', friendIds.toList())
           .eq('is_in_safe_zone', false)
           .timeout(const Duration(seconds: 15));
 
-      // Filter out incognito users client-side (check expiration)
+      // For each friend apply effectiveK = min(my radius, friend's radius)
+      // individually — building a union first is wrong because a large radius
+      // from one friend would bleed into the check for a short-radius friend.
       final now = DateTime.now().toUtc();
       final visibleFriends = resp.where((friend) {
+        // Incognito check
         final isIncognito = friend['is_incognito'] ?? false;
-        if (!isIncognito) return true;
+        if (isIncognito) {
+          final untilStr = friend['incognito_until'];
+          if (untilStr == null) return false;
+          final until = DateTime.parse(untilStr);
+          if (!now.isAfter(until)) return false;
+        }
 
-        final untilStr = friend['incognito_until'];
-        if (untilStr == null) return false; // Indefinite incognito
+        final friendHex = friend['last_h3_index_res9'] as String?;
+        if (friendHex == null) return false;
 
-        final until = DateTime.parse(untilStr);
-        return now.isAfter(until); // Only show if incognito expired
+        // Per-friend effective kRing: privacy-first (minimum wins)
+        if (currentH3Index == null || h3 == null) {
+          return hexesRes9.contains(friendHex);
+        }
+        final friendK = (friend['visibility_radius'] as int?) ?? 2;
+        final effectiveK = _visibilityRadius < friendK
+            ? _visibilityRadius
+            : friendK;
+        final cells = h3!.gridDisk(currentH3Index!, effectiveK);
+        return cells.map((c) => c.toRadixString(16)).contains(friendHex);
       }).toList();
 
       debugPrint('[supabase] Found ${visibleFriends.length} visible friends');
@@ -677,6 +830,8 @@ class _RadarTabState extends State<_RadarTab> {
         }
       });
 
+      _updateWidget();
+
       // Trigger proximity notifications with 5 h cooldown.
       if (friends.isNotEmpty) {
         ProximityService.instance.checkAndPing(friends);
@@ -709,16 +864,13 @@ class _RadarTabState extends State<_RadarTab> {
     }
 
     if (currentH3Index == null) {
-      if (mounted) {
-        setState(() {
-          statusText = 'No location available.';
-        });
-      }
+      // Don't overwrite a "Waiting for GPS fix" message — location events
+      // are already running, just no accurate fix yet.
       return;
     }
 
     try {
-      final kRingCells = h3!.gridDisk(currentH3Index!, 2);
+      final kRingCells = h3!.gridDisk(currentH3Index!, _visibilityRadius);
       if (mounted) {
         setState(() {
           currentKRing = kRingCells;
@@ -750,7 +902,7 @@ class _RadarTabState extends State<_RadarTab> {
 
     try {
       final cell = h3!.geoToCell(GeoCoord(lat: testLat, lon: testLng), 9);
-      final kRingCells = h3!.gridDisk(cell, 2);
+      final kRingCells = h3!.gridDisk(cell, _visibilityRadius);
 
       if (mounted) {
         setState(() {
@@ -772,7 +924,6 @@ class _RadarTabState extends State<_RadarTab> {
 
   void _showSectorBanner(String sector) {
     final overlay = Overlay.of(context);
-    if (overlay == null) return;
 
     final overlayEntry = OverlayEntry(
       builder: (ctx) {
@@ -980,13 +1131,16 @@ class _RadarTabState extends State<_RadarTab> {
                     children: [
                       // Hexagons at bottom layer
                       SizedBox.expand(
-                        child: CustomPaint(
-                          painter: HexagonGridPainter(
-                            hasNearbyFriends: hasNearbyFriends,
-                            isIncognito: _isIncognito,
-                            isInSafeZone: _isInSafeZone,
-                          ),
-                        ),
+                        child: _radiusLoaded
+                            ? CustomPaint(
+                                painter: HexagonGridPainter(
+                                  hasNearbyFriends: hasNearbyFriends,
+                                  isIncognito: _isIncognito,
+                                  isInSafeZone: _isInSafeZone,
+                                  visibilityRadius: _visibilityRadius,
+                                ),
+                              )
+                            : const SizedBox.shrink(),
                       ),
                       // Glow wave on top (BlendMode.plus adds light without covering)
                       if (!_isIncognito && !_isInSafeZone)
@@ -1012,7 +1166,42 @@ class _RadarTabState extends State<_RadarTab> {
                 ),
                 textAlign: TextAlign.center,
               ),
-              const SizedBox(height: 24),
+              const SizedBox(height: 16),
+              GestureDetector(
+                onTap: () => setState(() => _showDebug = !_showDebug),
+                child: Text(
+                  _showDebug ? 'hide debug ▲' : 'debug ▼',
+                  style: const TextStyle(color: Colors.white24, fontSize: 11),
+                ),
+              ),
+              if (_showDebug)
+                Container(
+                  width: double.infinity,
+                  margin: const EdgeInsets.only(top: 8),
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0A0A0A),
+                    border: Border.all(color: Colors.white12),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: _debugLog
+                        .map(
+                          (line) => Text(
+                            line,
+                            style: const TextStyle(
+                              fontFamily: 'Courier',
+                              color: Colors.white54,
+                              fontSize: 10,
+                              height: 1.5,
+                            ),
+                          ),
+                        )
+                        .toList(),
+                  ),
+                ),
+              const SizedBox(height: 8),
               // Debug: Test location button (only on non-mobile platforms)
               if (!Platform.isIOS && !Platform.isAndroid) ...[
                 const SizedBox(height: 12),
@@ -1080,11 +1269,13 @@ class HexagonGridPainter extends CustomPainter {
   final bool hasNearbyFriends;
   final bool isIncognito;
   final bool isInSafeZone;
+  final int visibilityRadius;
 
   HexagonGridPainter({
     required this.hasNearbyFriends,
     this.isIncognito = false,
     this.isInSafeZone = false,
+    this.visibilityRadius = 2,
   });
 
   @override
@@ -1093,50 +1284,47 @@ class HexagonGridPainter extends CustomPainter {
     final side = min(size.width, size.height) * 0.085;
     final spacingX = side * sqrt(3);
     final spacingY = side * 1.5;
-    final cells = <Offset>[];
+    final k = visibilityRadius;
 
-    for (var q = -2; q <= 2; q++) {
-      for (var r = max(-2, -q - 2); r <= min(2, -q + 2); r++) {
+    for (var q = -k; q <= k; q++) {
+      for (var r = max(-k, -q - k); r <= min(k, -q + k); r++) {
+        final isCore = q == 0 && r == 0;
         final x = (q + r / 2) * spacingX;
         final y = r * spacingY;
-        cells.add(center + Offset(x, y));
-      }
-    }
+        final cellCenter = center + Offset(x, y);
 
-    for (var i = 0; i < cells.length; i++) {
-      final cellCenter = cells[i];
-      final isCore = i == 9; // center cell
-      Color fillColor;
-      Color borderColor;
-      if (isCore) {
-        if (isIncognito) {
-          // Lila für Inkognito
-          fillColor = const Color(0xFF2D1B3D);
-          borderColor = Colors.deepPurple;
-        } else if (isInSafeZone) {
-          // Cyan/Mint für Safe Zone
-          fillColor = const Color(0xFF1A3A3D);
-          borderColor = const Color(0xFF4DD0E1);
+        Color fillColor;
+        Color borderColor;
+        if (isCore) {
+          if (isIncognito) {
+            fillColor = const Color(0xFF2D1B3D);
+            borderColor = Colors.deepPurple;
+          } else if (isInSafeZone) {
+            fillColor = const Color(0xFF1A3A3D);
+            borderColor = const Color(0xFF4DD0E1);
+          } else {
+            fillColor = hasNearbyFriends
+                ? const Color(0xFFFF8A00)
+                : const Color(0xFF311B00);
+            borderColor = hasNearbyFriends
+                ? const Color(0xFFFF8A00)
+                : Colors.white70;
+          }
         } else {
-          fillColor = hasNearbyFriends
-              ? const Color(0xFFFF8A00)
-              : const Color(0xFF311B00);
-          borderColor = hasNearbyFriends
-              ? const Color(0xFFFF8A00)
-              : Colors.white70;
+          fillColor = const Color(0xFF111111);
+          borderColor = Colors.white10;
         }
-      } else {
-        fillColor = const Color(0xFF111111);
-        borderColor = Colors.white10;
-      }
-      final fill = Paint()..color = fillColor;
-      canvas.drawPath(_hexagonPath(cellCenter, side), fill);
 
-      final border = Paint()
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = isCore ? 4 : 2
-        ..color = borderColor;
-      canvas.drawPath(_hexagonPath(cellCenter, side), border);
+        final path = _hexagonPath(cellCenter, side);
+        canvas.drawPath(path, Paint()..color = fillColor);
+        canvas.drawPath(
+          path,
+          Paint()
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = isCore ? 4 : 2
+            ..color = borderColor,
+        );
+      }
     }
   }
 
@@ -1162,6 +1350,7 @@ class HexagonGridPainter extends CustomPainter {
   bool shouldRepaint(covariant HexagonGridPainter oldDelegate) {
     return oldDelegate.hasNearbyFriends != hasNearbyFriends ||
         oldDelegate.isIncognito != isIncognito ||
-        oldDelegate.isInSafeZone != isInSafeZone;
+        oldDelegate.isInSafeZone != isInSafeZone ||
+        oldDelegate.visibilityRadius != visibilityRadius;
   }
 }
