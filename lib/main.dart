@@ -1,15 +1,18 @@
 import 'dart:async';
 import 'dart:io' show Platform, File;
 import 'dart:math' show cos, max, min, pi, sin, sqrt;
+import 'dart:ui' show ImageFilter;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_background_geolocation/flutter_background_geolocation.dart'
     as bg;
 import 'package:h3_flutter/h3_flutter.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:home_widget/home_widget.dart';
+import 'app_theme.dart';
 import 'glow_wave_overlay.dart';
 import 'auth_wrapper.dart';
 import 'friends_screen.dart';
@@ -75,8 +78,26 @@ Future<void> main() async {
     await HomeWidget.setAppGroupId('group.com.hangsocial.hang');
   }
 
+  // Load persisted theme preference.
+  final prefs = await SharedPreferences.getInstance();
+  final savedTheme = prefs.getString('themeMode');
+  if (savedTheme == 'light') {
+    themeNotifier.value = ThemeMode.light;
+  } else if (savedTheme == 'dark') {
+    themeNotifier.value = ThemeMode.dark;
+  }
+
   runApp(
-    const MaterialApp(debugShowCheckedModeBanner: false, home: AppEntry()),
+    ValueListenableBuilder<ThemeMode>(
+      valueListenable: themeNotifier,
+      builder: (_, mode, _) => MaterialApp(
+        debugShowCheckedModeBanner: false,
+        theme: buildLightTheme(),
+        darkTheme: buildDarkTheme(),
+        themeMode: mode,
+        home: const AppEntry(),
+      ),
+    ),
   );
 }
 
@@ -132,21 +153,11 @@ class _AppEntryState extends State<AppEntry> {
   }
 
   Future<void> _decide() async {
-    // If already authenticated, skip onboarding entirely.
     final session = Supabase.instance.client.auth.currentSession;
-    if (session != null) {
-      if (mounted) {
-        setState(() {
-          _showOnboarding = false;
-          _loading = false;
-        });
-      }
-      return;
-    }
-    // Not logged in → always show onboarding (DEBUG: ignore shared_prefs flag).
+    await Future<void>.delayed(const Duration(seconds: 1));
     if (mounted) {
       setState(() {
-        _showOnboarding = true;
+        _showOnboarding = session == null;
         _loading = false;
       });
     }
@@ -155,12 +166,7 @@ class _AppEntryState extends State<AppEntry> {
   @override
   Widget build(BuildContext context) {
     if (_loading) {
-      return const Scaffold(
-        backgroundColor: Colors.black,
-        body: Center(
-          child: CircularProgressIndicator(color: Color(0xFFFF8C00)),
-        ),
-      );
+      return const SplashScreen();
     }
     if (_showOnboarding) {
       return OnboardingScreen(
@@ -170,6 +176,89 @@ class _AppEntryState extends State<AppEntry> {
       );
     }
     return const AuthWrapper();
+  }
+}
+
+// ─── Splash screen ───────────────────────────────────────────────────────────
+class SplashScreen extends StatefulWidget {
+  const SplashScreen({super.key});
+  @override
+  State<SplashScreen> createState() => _SplashScreenState();
+}
+
+class _SplashScreenState extends State<SplashScreen>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1200),
+    )..repeat();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              'hang.',
+              style: TextStyle(
+                color: Color(0xFFFF8C00),
+                fontSize: 52,
+                fontWeight: FontWeight.bold,
+                letterSpacing: -1,
+              ),
+            ),
+            const SizedBox(height: 48),
+            AnimatedBuilder(
+              animation: _controller,
+              builder: (context, _) {
+                return Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: List.generate(4, (i) {
+                    // Each dot leads the animation by 0.2 of a cycle.
+                    final phase = (_controller.value - i * 0.2).clamp(0.0, 1.0);
+                    // Sine wave: 0 → up → 0 → down → 0
+                    final offset = sin(phase * 2 * pi) * 10.0;
+                    final opacity =
+                        0.35 + 0.65 * ((sin(phase * 2 * pi) + 1) / 2);
+                    return Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 5),
+                      child: Transform.translate(
+                        offset: Offset(0, -offset),
+                        child: Opacity(
+                          opacity: opacity,
+                          child: Container(
+                            width: 9,
+                            height: 9,
+                            decoration: const BoxDecoration(
+                              color: Color(0xFFFF8C00),
+                              shape: BoxShape.circle,
+                            ),
+                          ),
+                        ),
+                      ),
+                    );
+                  }),
+                );
+              },
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }
 
@@ -183,39 +272,96 @@ class HangApp extends StatefulWidget {
 class _HangAppState extends State<HangApp> {
   int _currentIndex = 0;
   final _radarKey = GlobalKey<_RadarTabState>();
+  final _friendsNavKey = GlobalKey<NavigatorState>();
 
   @override
   Widget build(BuildContext context) {
     final screens = [
       _RadarTab(key: _radarKey),
-      const FriendsScreen(),
+      _FriendsTab(navigatorKey: _friendsNavKey),
       SettingsScreen(
         onRadiusChanged: (k) => _radarKey.currentState?.onRadiusChanged(k),
       ),
     ];
     return Scaffold(
-      body: IndexedStack(index: _currentIndex, children: screens),
-      bottomNavigationBar: BottomNavigationBar(
-        currentIndex: _currentIndex,
-        onTap: (index) {
-          setState(() {
-            _currentIndex = index;
-          });
-        },
-        backgroundColor: Colors.black,
-        selectedItemColor: const Color(0xFFFF8800),
-        unselectedItemColor: Colors.grey,
-        type: BottomNavigationBarType.fixed,
-        showSelectedLabels: false,
-        showUnselectedLabels: false,
-        items: const [
-          BottomNavigationBarItem(icon: Icon(Icons.radar), label: 'Radar'),
-          BottomNavigationBarItem(icon: Icon(Icons.people), label: 'Friends'),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.settings),
-            label: 'Settings',
+      body: Stack(
+        children: [
+          // Extend body all the way to the bottom edge so the frosted pill
+          // floats over it. Each screen is responsible for its own padding.
+          Positioned.fill(
+            child: MediaQuery(
+              // Give screens a bottom inset equal to safe area + pill height
+              // so scroll views naturally scroll clear of the floating navbar.
+              data: MediaQuery.of(context).copyWith(
+                padding: MediaQuery.of(context).padding.copyWith(
+                  bottom: MediaQuery.of(context).padding.bottom + 80,
+                ),
+              ),
+              child: IndexedStack(index: _currentIndex, children: screens),
+            ),
+          ),
+          // Gradient fade at bottom so content doesn't bleed into pill
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: 0,
+            height: 140,
+            child: IgnorePointer(
+              child: Container(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [
+                      Colors.transparent,
+                      Theme.of(context).scaffoldBackgroundColor,
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+          // Floating pill navbar — positioned above home indicator
+          Positioned(
+            left: 32,
+            right: 32,
+            bottom: 12,
+            child: _FloatingNavBar(
+              currentIndex: _currentIndex,
+              onTap: (index) {
+                if (index == 1 && _currentIndex == 1) {
+                  _friendsNavKey.currentState?.popUntil(
+                    (route) => route.isFirst,
+                  );
+                  return;
+                }
+                setState(() => _currentIndex = index);
+              },
+            ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _FriendsTab extends StatelessWidget {
+  const _FriendsTab({required this.navigatorKey});
+
+  final GlobalKey<NavigatorState> navigatorKey;
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+      // Let the nested navigator consume back-gestures first.
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) navigatorKey.currentState?.maybePop();
+      },
+      child: Navigator(
+        key: navigatorKey,
+        onGenerateRoute: (_) =>
+            MaterialPageRoute(builder: (_) => const FriendsScreen()),
       ),
     );
   }
@@ -225,6 +371,94 @@ class _RadarTab extends StatefulWidget {
   const _RadarTab({super.key});
   @override
   State<_RadarTab> createState() => _RadarTabState();
+}
+
+// ─── Floating pill navigation bar ────────────────────────────────────────────
+
+class _FloatingNavBar extends StatelessWidget {
+  const _FloatingNavBar({required this.currentIndex, required this.onTap});
+
+  final int currentIndex;
+  final void Function(int) onTap;
+
+  static const _icons = [Icons.radar, Icons.people, Icons.settings];
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(60),
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 20, sigmaY: 20),
+        child: Container(
+          decoration: BoxDecoration(
+            color: isDark
+                ? const Color(0xFF232323).withOpacity(0.92)
+                : Colors.white.withOpacity(0.92),
+            borderRadius: BorderRadius.circular(60),
+            border: Border.all(
+              color: isDark
+                  ? Colors.white.withOpacity(0.13)
+                  : Colors.black.withOpacity(0.08),
+              width: 1,
+            ),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(isDark ? 0.60 : 0.15),
+                blurRadius: 32,
+                offset: const Offset(0, 10),
+              ),
+              BoxShadow(
+                color: const Color(0xFFFF8800).withOpacity(0.06),
+                blurRadius: 40,
+                offset: const Offset(0, 0),
+              ),
+            ],
+          ),
+          padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 10),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: List.generate(_icons.length, (i) {
+              final active = i == currentIndex;
+              return GestureDetector(
+                onTap: () => onTap(i),
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 220),
+                  curve: Curves.easeInOut,
+                  width: 52,
+                  height: 52,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: active
+                        ? const Color(0xFFFF8800)
+                        : (isDark
+                              ? Colors.white.withOpacity(0.07)
+                              : Colors.black.withOpacity(0.05)),
+                    boxShadow: active
+                        ? [
+                            BoxShadow(
+                              color: const Color(0xFFFF8800).withOpacity(0.55),
+                              blurRadius: 18,
+                              spreadRadius: 1,
+                            ),
+                          ]
+                        : [],
+                  ),
+                  child: Icon(
+                    _icons[i],
+                    color: active
+                        ? Colors.black
+                        : (isDark ? Colors.white54 : Colors.black45),
+                    size: 22,
+                  ),
+                ),
+              );
+            }),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class _RadarTabState extends State<_RadarTab> {
@@ -461,8 +695,8 @@ class _RadarTabState extends State<_RadarTab> {
     if (updatedAtStr == null) return '?';
 
     try {
-      final updatedAt = DateTime.parse(updatedAtStr);
-      final age = DateTime.now().difference(updatedAt);
+      final updatedAt = DateTime.parse(updatedAtStr).toUtc();
+      final age = DateTime.now().toUtc().difference(updatedAt);
 
       if (age.inMinutes < 10) {
         return '<10m ago';
@@ -645,7 +879,7 @@ class _RadarTabState extends State<_RadarTab> {
           .update({
             'last_h3_index_res9': hexIndex,
             'is_in_safe_zone': isInSafeZone,
-            'updated_at': DateTime.now().toIso8601String(),
+            'updated_at': DateTime.now().toUtc().toIso8601String(),
           })
           .eq('id', user.id);
     } catch (e) {
@@ -998,19 +1232,7 @@ class _RadarTabState extends State<_RadarTab> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.black,
-      appBar: AppBar(
-        backgroundColor: Colors.black,
-        elevation: 0,
-        title: const Text(
-          'hang.',
-          style: TextStyle(
-            color: Colors.white,
-            fontSize: 26,
-            fontWeight: FontWeight.bold,
-          ),
-        ),
-      ),
+      appBar: AppBar(elevation: 0, title: const Text('hang.')),
       body: RefreshIndicator(
         onRefresh: _refreshSector,
         color: const Color(0xFFFF8C00),
@@ -1138,6 +1360,9 @@ class _RadarTabState extends State<_RadarTab> {
                                   isIncognito: _isIncognito,
                                   isInSafeZone: _isInSafeZone,
                                   visibilityRadius: _visibilityRadius,
+                                  isDark:
+                                      Theme.of(context).brightness ==
+                                      Brightness.dark,
                                 ),
                               )
                             : const SizedBox.shrink(),
@@ -1160,7 +1385,9 @@ class _RadarTabState extends State<_RadarTab> {
                 style: TextStyle(
                   color: hasNearbyFriends
                       ? const Color(0xFFFF8A00)
-                      : Colors.white70,
+                      : Theme.of(
+                          context,
+                        ).colorScheme.onSurface.withValues(alpha: 0.7),
                   fontSize: 22,
                   fontWeight: FontWeight.bold,
                 ),
@@ -1171,7 +1398,12 @@ class _RadarTabState extends State<_RadarTab> {
                 onTap: () => setState(() => _showDebug = !_showDebug),
                 child: Text(
                   _showDebug ? 'hide debug ▲' : 'debug ▼',
-                  style: const TextStyle(color: Colors.white24, fontSize: 11),
+                  style: TextStyle(
+                    color: Theme.of(
+                      context,
+                    ).colorScheme.onSurface.withValues(alpha: 0.2),
+                    fontSize: 11,
+                  ),
                 ),
               ),
               if (_showDebug)
@@ -1180,8 +1412,12 @@ class _RadarTabState extends State<_RadarTab> {
                   margin: const EdgeInsets.only(top: 8),
                   padding: const EdgeInsets.all(10),
                   decoration: BoxDecoration(
-                    color: const Color(0xFF0A0A0A),
-                    border: Border.all(color: Colors.white12),
+                    color: Theme.of(context).colorScheme.surface,
+                    border: Border.all(
+                      color: Theme.of(
+                        context,
+                      ).colorScheme.onSurface.withValues(alpha: 0.08),
+                    ),
                     borderRadius: BorderRadius.circular(8),
                   ),
                   child: Column(
@@ -1190,9 +1426,11 @@ class _RadarTabState extends State<_RadarTab> {
                         .map(
                           (line) => Text(
                             line,
-                            style: const TextStyle(
+                            style: TextStyle(
                               fontFamily: 'Courier',
-                              color: Colors.white54,
+                              color: Theme.of(
+                                context,
+                              ).colorScheme.onSurface.withValues(alpha: 0.5),
                               fontSize: 10,
                               height: 1.5,
                             ),
@@ -1234,21 +1472,28 @@ class _RadarTabState extends State<_RadarTab> {
                         Text(
                           '@$handle',
                           style: const TextStyle(
-                            color: Colors.orangeAccent,
+                            color: Color(0xFFFF8A00),
                             fontSize: 16,
                             fontWeight: FontWeight.w600,
                           ),
                         ),
                         const SizedBox(width: 6),
-                        const Text(
+                        Text(
                           '•',
-                          style: TextStyle(color: Colors.white24, fontSize: 14),
+                          style: TextStyle(
+                            color: Theme.of(
+                              context,
+                            ).colorScheme.onSurface.withValues(alpha: 0.2),
+                            fontSize: 14,
+                          ),
                         ),
                         const SizedBox(width: 6),
                         Text(
                           ageLabel,
-                          style: const TextStyle(
-                            color: Colors.white38,
+                          style: TextStyle(
+                            color: Theme.of(
+                              context,
+                            ).colorScheme.onSurface.withValues(alpha: 0.35),
                             fontSize: 13,
                             fontWeight: FontWeight.w400,
                           ),
@@ -1270,12 +1515,14 @@ class HexagonGridPainter extends CustomPainter {
   final bool isIncognito;
   final bool isInSafeZone;
   final int visibilityRadius;
+  final bool isDark;
 
   HexagonGridPainter({
     required this.hasNearbyFriends,
     this.isIncognito = false,
     this.isInSafeZone = false,
     this.visibilityRadius = 2,
+    this.isDark = true,
   });
 
   @override
@@ -1308,11 +1555,13 @@ class HexagonGridPainter extends CustomPainter {
                 : const Color(0xFF311B00);
             borderColor = hasNearbyFriends
                 ? const Color(0xFFFF8A00)
-                : Colors.white70;
+                : (isDark ? Colors.white70 : Colors.black38);
           }
         } else {
-          fillColor = const Color(0xFF111111);
-          borderColor = Colors.white10;
+          fillColor = isDark
+              ? const Color(0xFF111111)
+              : const Color(0xFFD4D4D8);
+          borderColor = isDark ? Colors.white10 : Colors.black12;
         }
 
         final path = _hexagonPath(cellCenter, side);
@@ -1351,6 +1600,7 @@ class HexagonGridPainter extends CustomPainter {
     return oldDelegate.hasNearbyFriends != hasNearbyFriends ||
         oldDelegate.isIncognito != isIncognito ||
         oldDelegate.isInSafeZone != isInSafeZone ||
-        oldDelegate.visibilityRadius != visibilityRadius;
+        oldDelegate.visibilityRadius != visibilityRadius ||
+        oldDelegate.isDark != isDark;
   }
 }

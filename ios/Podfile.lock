@@ -8,6 +8,8 @@ PODS:
     - CocoaLumberjack/Core (= 3.8.5)
   - CocoaLumberjack/Core (3.8.5)
   - Flutter (1.0.0)
+  - flutter_apns_only (0.0.1):
+    - Flutter
   - flutter_background_geolocation (4.18.3):
     - CocoaLumberjack (~> 3.8.5)
     - Flutter
@@ -18,11 +20,15 @@ PODS:
     - FlutterMacOS
   - home_widget (0.0.1):
     - Flutter
+  - image_cropper (0.0.4):
+    - Flutter
+    - TOCropViewController (~> 2.7.4)
   - image_picker_ios (0.0.1):
     - Flutter
   - shared_preferences_foundation (0.0.1):
     - Flutter
     - FlutterMacOS
+  - TOCropViewController (2.7.4)
   - TSBackgroundFetch (4.1.1)
   - url_launcher_ios (0.0.1):
     - Flutter
@@ -31,10 +37,12 @@ DEPENDENCIES:
   - app_links (from `.symlinks/plugins/app_links/ios`)
   - background_fetch (from `.symlinks/plugins/background_fetch/ios`)
   - Flutter (from `Flutter`)
+  - flutter_apns_only (from `.symlinks/plugins/flutter_apns_only/ios`)
   - flutter_background_geolocation (from `.symlinks/plugins/flutter_background_geolocation/ios`)
   - flutter_local_notifications (from `.symlinks/plugins/flutter_local_notifications/ios`)
   - h3_flutter (from `.symlinks/plugins/h3_flutter/darwin`)
   - home_widget (from `.symlinks/plugins/home_widget/ios`)
+  - image_cropper (from `.symlinks/plugins/image_cropper/ios`)
   - image_picker_ios (from `.symlinks/plugins/image_picker_ios/ios`)
   - shared_preferences_foundation (from `.symlinks/plugins/shared_preferences_foundation/darwin`)
   - url_launcher_ios (from `.symlinks/plugins/url_launcher_ios/ios`)
@@ -42,6 +50,7 @@ DEPENDENCIES:
 SPEC REPOS:
   trunk:
     - CocoaLumberjack
+    - TOCropViewController
     - TSBackgroundFetch
 
 EXTERNAL SOURCES:
@@ -51,6 +60,8 @@ EXTERNAL SOURCES:
     :path: ".symlinks/plugins/background_fetch/ios"
   Flutter:
     :path: Flutter
+  flutter_apns_only:
+    :path: ".symlinks/plugins/flutter_apns_only/ios"
   flutter_background_geolocation:
     :path: ".symlinks/plugins/flutter_background_geolocation/ios"
   flutter_local_notifications:
@@ -59,6 +70,8 @@ EXTERNAL SOURCES:
     :path: ".symlinks/plugins/h3_flutter/darwin"
   home_widget:
     :path: ".symlinks/plugins/home_widget/ios"
+  image_cropper:
+    :path: ".symlinks/plugins/image_cropper/ios"
   image_picker_ios:
     :path: ".symlinks/plugins/image_picker_ios/ios"
   shared_preferences_foundation:
@@ -71,12 +84,15 @@ SPEC CHECKSUMS:
   background_fetch: 858ab7f1d2f525e90808445a8d40dfdc33660aff
   CocoaLumberjack: 6a459bc897d6d80bd1b8c78482ec7ad05dffc3f0
   Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
+  flutter_apns_only: bd278c53433cb01cd66152843f7247fe10b9a9ea
   flutter_background_geolocation: 81f17ef8f561dba232729c46275de1dbdfa89e06
   flutter_local_notifications: 395056b3175ba4f08480a7c5de30cd36d69827e4
   h3_flutter: a7af78474210b8d5e59ff9e4539ecfc1ea143706
   home_widget: 54b4f6b36ed8d64cfee594a476225c35c3e45091
+  image_cropper: c4326ea50132b1e1564499e5d32a84f01fb03537
   image_picker_ios: e0ece4aa2a75771a7de3fa735d26d90817041326
   shared_preferences_foundation: 7036424c3d8ec98dfe75ff1667cb0cd531ec82bb
+  TOCropViewController: 80b8985ad794298fb69d3341de183f33d1853654
   TSBackgroundFetch: 18918b6449a1e3f01eb0f5b44d6d79ce6160a5a5
   url_launcher_ios: 7a95fa5b60cc718a708b8f2966718e93db0cef1b
 

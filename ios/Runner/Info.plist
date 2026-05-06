@@ -24,20 +24,22 @@
 	<string>????</string>
 	<key>CFBundleVersion</key>
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
-	<key>NSMotionUsageDescription</key>
-	<string>hang nutzt Bewegungssensoren, um den Standort-Modus intelligent zu wechseln und Akku zu sparen</string>
-	<key>NSPhotoLibraryUsageDescription</key>
-	<string>hang needs access to your photo library to set your profile picture.</string>
-	<key>NSCameraUsageDescription</key>
-	<string>hang needs camera access to take a profile picture.</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>hang needs camera access to take a profile picture.</string>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
-	<string>hang braucht deinen Standort, um dich mit Freunden im selben Sektor zu matchen.</string>
+	<string>hang needs your location at all times to notify you when friends are nearby, even when the app is closed.</string>
 	<key>NSLocationAlwaysUsageDescription</key>
-	<string>hang braucht deinen Standort im Hintergrund, um dich mit Freunden zu matchen.</string>
+	<string>hang needs your location in the background to notify you when friends are nearby, even when the app is closed.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>hang braucht deinen Standort, um Sektoren zu berechnen.</string>
+	<string>hang needs your location to find friends near you.</string>
+	<key>NSMotionUsageDescription</key>
+	<string>hang uses motion sensors to intelligently switch location mode and save battery</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>hang needs access to your photo library to set your profile picture.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
@@ -68,7 +70,7 @@
 		<string>remote-notification</string>
 	</array>
 	<key>UILaunchStoryboardName</key>
-	<string>LaunchScreen</string>
+	<string>LaunchScreen.storyboard</string>
 	<key>UIMainStoryboardFile</key>
 	<string>Main</string>
 	<key>UISupportedInterfaceOrientations</key>

@@ -32,17 +32,17 @@ class _PostSignupSetupScreenState extends State<PostSignupSetupScreen> {
     } catch (e) {
       debugPrint('[setup] Error saving visibility_radius: $e');
     }
-    if (mounted)
+    if (mounted) {
       setState(() {
         _isSaving = false;
         _step = 1;
       });
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.black,
       body: SafeArea(
         child: AnimatedSwitcher(
           duration: const Duration(milliseconds: 350),
@@ -407,10 +407,11 @@ class _SetupRadiusPainter extends CustomPainter {
         center.dx + side * cos(angle),
         center.dy + side * sin(angle),
       );
-      if (i == 0)
+      if (i == 0) {
         path.moveTo(pt.dx, pt.dy);
-      else
+      } else {
         path.lineTo(pt.dx, pt.dy);
+      }
     }
     path.close();
     return path;

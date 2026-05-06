@@ -24,6 +24,7 @@ class _FriendsScreenState extends State<FriendsScreen>
   String? _currentUserId;
   bool _isIncognito = false;
   DateTime? _incognitoUntil;
+  RealtimeChannel? _friendshipsChannel;
 
   @override
   void initState() {
@@ -32,10 +33,37 @@ class _FriendsScreenState extends State<FriendsScreen>
     _currentUserId = Supabase.instance.client.auth.currentUser?.id;
     _loadIncognitoStatus();
     _loadFriendships();
+    _subscribeToFriendships();
+  }
+
+  void _subscribeToFriendships() {
+    if (_currentUserId == null) return;
+    _friendshipsChannel = Supabase.instance.client
+        .channel('friends_screen_$_currentUserId')
+        .onPostgresChanges(
+          event: PostgresChangeEvent.insert,
+          schema: 'public',
+          table: 'friendships',
+          callback: (_) => _loadFriendships(),
+        )
+        .onPostgresChanges(
+          event: PostgresChangeEvent.update,
+          schema: 'public',
+          table: 'friendships',
+          callback: (_) => _loadFriendships(),
+        )
+        .onPostgresChanges(
+          event: PostgresChangeEvent.delete,
+          schema: 'public',
+          table: 'friendships',
+          callback: (_) => _loadFriendships(),
+        )
+        .subscribe();
   }
 
   @override
   void dispose() {
+    _friendshipsChannel?.unsubscribe();
     _tabController.dispose();
     _searchController.dispose();
     _searchDebounce?.cancel();
@@ -83,7 +111,7 @@ class _FriendsScreenState extends State<FriendsScreen>
             requester_id,
             status,
             created_at,
-            requester:profiles!friendships_requester_id_fkey(handle)
+            requester:profiles!friendships_requester_id_fkey(handle, avatar_url)
           ''')
           .eq('addressee_id', _currentUserId!)
           .eq('status', 'pending')
@@ -97,7 +125,7 @@ class _FriendsScreenState extends State<FriendsScreen>
             addressee_id,
             status,
             created_at,
-            addressee:profiles!friendships_addressee_id_fkey(handle)
+            addressee:profiles!friendships_addressee_id_fkey(handle, avatar_url)
           ''')
           .eq('requester_id', _currentUserId!)
           .eq('status', 'pending')
@@ -109,7 +137,7 @@ class _FriendsScreenState extends State<FriendsScreen>
           .select('''
             id,
             addressee_id,
-            addressee:profiles!friendships_addressee_id_fkey(handle)
+            addressee:profiles!friendships_addressee_id_fkey(handle, avatar_url)
           ''')
           .eq('requester_id', _currentUserId!)
           .eq('status', 'accepted');
@@ -119,7 +147,7 @@ class _FriendsScreenState extends State<FriendsScreen>
           .select('''
             id,
             requester_id,
-            requester:profiles!friendships_requester_id_fkey(handle)
+            requester:profiles!friendships_requester_id_fkey(handle, avatar_url)
           ''')
           .eq('addressee_id', _currentUserId!)
           .eq('status', 'accepted');
@@ -134,6 +162,7 @@ class _FriendsScreenState extends State<FriendsScreen>
             'id': map['id'],
             'user_id': map['addressee_id'],
             'handle': addressee['handle'],
+            'avatar_url': addressee['avatar_url'],
           });
         }
       }
@@ -145,6 +174,7 @@ class _FriendsScreenState extends State<FriendsScreen>
             'id': map['id'],
             'user_id': map['requester_id'],
             'handle': requester['handle'],
+            'avatar_url': requester['avatar_url'],
           });
         }
       }
@@ -155,6 +185,10 @@ class _FriendsScreenState extends State<FriendsScreen>
           _sentRequests = sentResp.cast<Map<String, dynamic>>();
           _friendsList = allFriends;
         });
+        // Keep search results in sync with the updated friendship state.
+        if (_searchController.text.trim().isNotEmpty) {
+          _searchUsers(_searchController.text);
+        }
       }
     } catch (e) {
       debugPrint('[friends] Error loading friendships: $e');
@@ -194,7 +228,7 @@ class _FriendsScreenState extends State<FriendsScreen>
       final searchQuery = query.trim().toLowerCase();
       final resp = await Supabase.instance.client
           .from('profiles')
-          .select('id, handle')
+          .select('id, handle, avatar_url')
           .ilike('handle', '%$searchQuery%')
           .limit(20);
 
@@ -336,7 +370,7 @@ class _FriendsScreenState extends State<FriendsScreen>
           .from('friendships')
           .update({
             'status': 'accepted',
-            'updated_at': DateTime.now().toIso8601String(),
+            'updated_at': DateTime.now().toUtc().toIso8601String(),
           })
           .eq('id', friendshipId);
 
@@ -362,7 +396,7 @@ class _FriendsScreenState extends State<FriendsScreen>
           .from('friendships')
           .update({
             'status': 'rejected',
-            'updated_at': DateTime.now().toIso8601String(),
+            'updated_at': DateTime.now().toUtc().toIso8601String(),
           })
           .eq('id', friendshipId);
 
@@ -383,11 +417,35 @@ class _FriendsScreenState extends State<FriendsScreen>
   }
 
   Future<void> _removeFriend(String friendshipId) async {
+    if (_currentUserId == null) return;
     try {
-      await Supabase.instance.client
+      // Use select() so we can verify whether the row was actually deleted.
+      // The RLS policy may only allow deletion when the current user is the
+      // requester, so we also filter on that column as a fallback. Because
+      // the friendship row could be in either direction we try both.
+      final deleted = await Supabase.instance.client
           .from('friendships')
           .delete()
-          .eq('id', friendshipId);
+          .eq('id', friendshipId)
+          .or('requester_id.eq.$_currentUserId,addressee_id.eq.$_currentUserId')
+          .select('id');
+
+      debugPrint('[friends] Remove result: $deleted');
+
+      if (!mounted) return;
+
+      if (deleted.isEmpty) {
+        // Row wasn't deleted — likely an RLS policy gap. Try a workaround by
+        // updating the status to 'removed' so either side can trigger it.
+        debugPrint('[friends] Delete returned 0 rows — trying status update');
+        await Supabase.instance.client
+            .from('friendships')
+            .update({'status': 'removed'})
+            .eq('id', friendshipId)
+            .or(
+              'requester_id.eq.$_currentUserId,addressee_id.eq.$_currentUserId',
+            );
+      }
 
       if (mounted) {
         ScaffoldMessenger.of(
@@ -408,28 +466,12 @@ class _FriendsScreenState extends State<FriendsScreen>
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.black,
-      appBar: AppBar(
-        backgroundColor: Colors.black,
-        elevation: 0,
-        title: const Text(
-          'friends.',
-          style: TextStyle(
-            color: Colors.white,
-            fontSize: 26,
-            fontWeight: FontWeight.bold,
-          ),
-        ),
-      ),
+      appBar: AppBar(elevation: 0, title: const Text('friends.')),
       body: Column(
         children: [
           Material(
-            color: Colors.black,
             child: TabBar(
               controller: _tabController,
-              labelColor: Colors.white,
-              unselectedLabelColor: Colors.white60,
-              indicatorColor: Colors.white,
               tabs: [
                 Tab(text: 'Search', icon: const Icon(Icons.search)),
                 Tab(
@@ -454,6 +496,40 @@ class _FriendsScreenState extends State<FriendsScreen>
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  static String? _resolveAvatarUrl(String? stored) {
+    if (stored == null) return null;
+    if (stored.startsWith('http')) return stored;
+    return Supabase.instance.client.storage
+        .from('avatars')
+        .getPublicUrl(stored);
+  }
+
+  Widget _avatarCircle(
+    String? avatarStored,
+    String handle, {
+    double radius = 20,
+    Color fallbackColor = Colors.deepOrange,
+  }) {
+    final url = _resolveAvatarUrl(avatarStored);
+    if (url != null) {
+      return CircleAvatar(
+        radius: radius,
+        backgroundColor: fallbackColor,
+        backgroundImage: NetworkImage(url),
+        onBackgroundImageError: (_, _) {},
+        child: null,
+      );
+    }
+    return CircleAvatar(
+      radius: radius,
+      backgroundColor: fallbackColor,
+      child: Text(
+        handle[0].toUpperCase(),
+        style: TextStyle(color: Colors.white, fontSize: radius * 0.9),
       ),
     );
   }
@@ -512,22 +588,20 @@ class _FriendsScreenState extends State<FriendsScreen>
           child: TextField(
             controller: _searchController,
             enabled: !_isIncognito,
-            style: TextStyle(
-              color: _isIncognito ? Colors.grey[700] : Colors.white,
-            ),
             decoration: InputDecoration(
               hintText: _isIncognito
                   ? 'Search disabled in Incognito Mode'
                   : 'Search by handle...',
-              hintStyle: TextStyle(color: Colors.grey[600]),
               prefixIcon: Icon(
                 Icons.search,
-                color: _isIncognito ? Colors.grey[700] : Colors.grey,
+                color: _isIncognito
+                    ? Colors.deepPurple.withValues(alpha: 0.5)
+                    : null,
               ),
               filled: true,
               fillColor: _isIncognito
-                  ? Colors.deepPurple.withValues(alpha: 0.1)
-                  : Colors.grey[900],
+                  ? Colors.deepPurple.withValues(alpha: 0.08)
+                  : null,
               border: OutlineInputBorder(
                 borderRadius: BorderRadius.circular(12),
                 borderSide: _isIncognito
@@ -556,7 +630,6 @@ class _FriendsScreenState extends State<FriendsScreen>
                         : (_searchController.text.isEmpty
                               ? 'Enter a handle to search'
                               : 'No users found'),
-                    style: const TextStyle(color: Colors.grey),
                   ),
                 )
               : ListView.builder(
@@ -611,19 +684,13 @@ class _FriendsScreenState extends State<FriendsScreen>
                               ProfileScreen(userId: userId, handle: handle),
                         ),
                       ),
-                      leading: CircleAvatar(
-                        backgroundColor: Colors.deepOrange,
-                        child: Text(
-                          handle[0].toUpperCase(),
-                          style: const TextStyle(color: Colors.white),
-                        ),
+                      leading: _avatarCircle(
+                        user['avatar_url'] as String?,
+                        handle,
                       ),
                       title: Text(
                         '@$handle',
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontWeight: FontWeight.bold,
-                        ),
+                        style: const TextStyle(fontWeight: FontWeight.bold),
                       ),
                       trailing: trailingWidget,
                     );
@@ -636,12 +703,7 @@ class _FriendsScreenState extends State<FriendsScreen>
 
   Widget _buildRequestsTab() {
     if (_pendingRequests.isEmpty) {
-      return const Center(
-        child: Text(
-          'No pending requests',
-          style: TextStyle(color: Colors.grey),
-        ),
-      );
+      return const Center(child: Text('No pending requests'));
     }
 
     return ListView.builder(
@@ -651,21 +713,15 @@ class _FriendsScreenState extends State<FriendsScreen>
         final friendshipId = request['id'] as String;
         final requester = request['requester'] as Map?;
         final handle = requester?['handle'] as String? ?? 'Unknown';
+        final avatarStored = requester?['avatar_url'] as String?;
 
         return Card(
-          color: Colors.grey[900],
           margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
           child: Padding(
             padding: const EdgeInsets.all(12),
             child: Row(
               children: [
-                CircleAvatar(
-                  backgroundColor: Colors.deepOrange,
-                  child: Text(
-                    handle[0].toUpperCase(),
-                    style: const TextStyle(color: Colors.white),
-                  ),
-                ),
+                _avatarCircle(avatarStored, handle),
                 const SizedBox(width: 12),
                 Expanded(
                   child: Column(
@@ -674,7 +730,6 @@ class _FriendsScreenState extends State<FriendsScreen>
                       Text(
                         '@$handle',
                         style: const TextStyle(
-                          color: Colors.white,
                           fontWeight: FontWeight.bold,
                           fontSize: 16,
                         ),
@@ -682,7 +737,7 @@ class _FriendsScreenState extends State<FriendsScreen>
                       const SizedBox(height: 4),
                       const Text(
                         'wants to be your friend',
-                        style: TextStyle(color: Colors.grey, fontSize: 12),
+                        style: TextStyle(fontSize: 12),
                       ),
                     ],
                   ),
@@ -712,7 +767,6 @@ class _FriendsScreenState extends State<FriendsScreen>
       return const Center(
         child: Text(
           'No friends yet.\nSearch for handles to add friends!',
-          style: TextStyle(color: Colors.grey),
           textAlign: TextAlign.center,
         ),
       );
@@ -735,19 +789,14 @@ class _FriendsScreenState extends State<FriendsScreen>
               ),
             ),
           ),
-          leading: CircleAvatar(
-            backgroundColor: Colors.green,
-            child: Text(
-              handle[0].toUpperCase(),
-              style: const TextStyle(color: Colors.white),
-            ),
+          leading: _avatarCircle(
+            friend['avatar_url'] as String?,
+            handle,
+            fallbackColor: Colors.green,
           ),
           title: Text(
             '@$handle',
-            style: const TextStyle(
-              color: Colors.white,
-              fontWeight: FontWeight.bold,
-            ),
+            style: const TextStyle(fontWeight: FontWeight.bold),
           ),
           trailing: IconButton(
             icon: const Icon(Icons.person_remove, color: Colors.red),
@@ -755,14 +804,9 @@ class _FriendsScreenState extends State<FriendsScreen>
               showDialog(
                 context: context,
                 builder: (context) => AlertDialog(
-                  backgroundColor: Colors.grey[900],
-                  title: const Text(
-                    'Remove friend?',
-                    style: TextStyle(color: Colors.white),
-                  ),
+                  title: const Text('Remove friend?'),
                   content: Text(
                     'Do you really want to remove @$handle from your friends?',
-                    style: const TextStyle(color: Colors.grey),
                   ),
                   actions: [
                     TextButton(

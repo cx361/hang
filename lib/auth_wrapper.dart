@@ -81,12 +81,7 @@ class _AuthWrapperState extends State<AuthWrapper> {
   @override
   Widget build(BuildContext context) {
     if (_isLoading) {
-      return const Scaffold(
-        backgroundColor: Colors.black,
-        body: Center(
-          child: CircularProgressIndicator(color: Color(0xFFFF8800)),
-        ),
-      );
+      return const SplashScreen();
     }
 
     // Not logged in → AuthScreen

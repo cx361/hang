@@ -45,6 +45,8 @@ dependencies:
   h3_dart: ^0.7.0
   home_widget: ^0.9.1
   image_picker: ^1.2.2
+  image_cropper: ^9.1.0
+  flutter_apns_only: ^1.6.0
 
 
 dev_dependencies:

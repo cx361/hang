@@ -3,7 +3,10 @@ import 'dart:math' show cos, pi, sin, sqrt;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:image_cropper/image_cropper.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'app_theme.dart';
 import 'safe_zones_screen.dart';
 
 class SettingsScreen extends StatefulWidget {
@@ -21,13 +24,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
   DateTime? _incognitoUntil;
   String? _handle;
   String? _avatarUrl;
+  bool _avatarLoadError = false;
   bool _isHandleLoading = true;
   bool _isLoading = true;
   bool _isUploadingAvatar = false;
+  bool _showActivity = false;
   Timer? _updateTimer;
   int _visibilityRadius = 2;
   DateTime? _radiusCooldownUntil;
   Timer? _cooldownTimer;
+  ThemeMode _themeMode = themeNotifier.value;
 
   static const _kRadiusCooldown = Duration(minutes: 15);
 
@@ -54,6 +60,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final m = remaining.inMinutes;
     final s = remaining.inSeconds.remainder(60);
     return m > 0 ? 'Locked — ${m}m ${s}s' : 'Locked — ${s}s';
+  }
+
+  Future<void> _saveThemeMode(ThemeMode mode) async {
+    setState(() => _themeMode = mode);
+    themeNotifier.value = mode;
+    final prefs = await SharedPreferences.getInstance();
+    final key = mode == ThemeMode.light
+        ? 'light'
+        : mode == ThemeMode.dark
+        ? 'dark'
+        : 'system';
+    await prefs.setString('themeMode', key);
   }
 
   @override
@@ -86,6 +104,42 @@ class _SettingsScreenState extends State<SettingsScreen> {
     super.dispose();
   }
 
+  void _viewAvatar() {
+    if (_avatarUrl == null || _avatarLoadError) return;
+    showDialog(
+      context: context,
+      builder: (_) => GestureDetector(
+        onTap: () => Navigator.pop(context),
+        child: Scaffold(
+          backgroundColor: Colors.black87,
+          body: Center(
+            child: Hero(
+              tag: 'avatar_preview',
+              child: Image.network(
+                _avatarUrl!,
+                fit: BoxFit.contain,
+                errorBuilder: (_, _, _) => const Icon(
+                  Icons.broken_image,
+                  color: Colors.white54,
+                  size: 64,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Converts a stored avatar value (path or legacy full URL) to a display URL.
+  static String? _resolveAvatarUrl(String? stored) {
+    if (stored == null) return null;
+    if (stored.startsWith('http')) return stored; // legacy full-URL format
+    return Supabase.instance.client.storage
+        .from('avatars')
+        .getPublicUrl(stored);
+  }
+
   Future<void> _loadAvatar() async {
     final userId = Supabase.instance.client.auth.currentUser?.id;
     if (userId == null) return;
@@ -95,7 +149,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
           .select('avatar_url')
           .eq('id', userId)
           .single();
-      if (mounted) setState(() => _avatarUrl = resp['avatar_url'] as String?);
+      if (mounted) {
+        setState(() {
+          _avatarUrl = _resolveAvatarUrl(resp['avatar_url'] as String?);
+          _avatarLoadError = false;
+        });
+      }
     } catch (e) {
       debugPrint('[settings] Error loading avatar: $e');
     }
@@ -108,15 +167,36 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final picker = ImagePicker();
     final picked = await picker.pickImage(
       source: ImageSource.gallery,
-      maxWidth: 512,
-      maxHeight: 512,
-      imageQuality: 85,
+      maxWidth: 1024,
+      maxHeight: 1024,
+      imageQuality: 90,
     );
     if (picked == null) return;
 
+    // ── Crop ──────────────────────────────────────────────────────────────
+    final cropped = await ImageCropper().cropImage(
+      sourcePath: picked.path,
+      aspectRatio: const CropAspectRatio(ratioX: 1, ratioY: 1),
+      uiSettings: [
+        AndroidUiSettings(
+          toolbarTitle: 'Crop profile picture',
+          toolbarColor: Colors.black,
+          toolbarWidgetColor: Colors.white,
+          activeControlsWidgetColor: const Color(0xFFFF8C00),
+          lockAspectRatio: true,
+        ),
+        IOSUiSettings(
+          title: 'Crop profile picture',
+          aspectRatioLockEnabled: true,
+          resetAspectRatioEnabled: false,
+        ),
+      ],
+    );
+    if (cropped == null) return;
+
     setState(() => _isUploadingAvatar = true);
     try {
-      final bytes = await picked.readAsBytes();
+      final bytes = await cropped.readAsBytes();
 
       // ── Size guard: reject anything over 5 MB ─────────────────────────
       const maxBytes = 5 * 1024 * 1024; // 5 MB
@@ -168,18 +248,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
           );
 
+      // Store only the path in the DB — never the full URL with cache-buster.
+      await Supabase.instance.client
+          .from('profiles')
+          .update({'avatar_url': path})
+          .eq('id', userId);
+
       final rawUrl = Supabase.instance.client.storage
           .from('avatars')
           .getPublicUrl(path);
-      // Append a cache-bust param so the new image loads immediately.
-      final url = '$rawUrl?t=${DateTime.now().millisecondsSinceEpoch}';
-
-      await Supabase.instance.client
-          .from('profiles')
-          .update({'avatar_url': url})
-          .eq('id', userId);
-
-      if (mounted) setState(() => _avatarUrl = url);
+      // Cache-bust only in local state so the new image loads immediately.
+      if (mounted) {
+        setState(() {
+          _avatarUrl = '$rawUrl?t=${DateTime.now().millisecondsSinceEpoch}';
+          _avatarLoadError = false;
+        });
+      }
     } catch (e) {
       debugPrint('[settings] Avatar upload error: $e');
       if (mounted) {
@@ -227,7 +311,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     try {
       final resp = await Supabase.instance.client
           .from('profiles')
-          .select('is_incognito, incognito_until, avatar_url')
+          .select('is_incognito, incognito_until, avatar_url, show_activity')
           .eq('id', userId)
           .single();
 
@@ -236,7 +320,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _isIncognito = resp['is_incognito'] ?? false;
           final until = resp['incognito_until'];
           _incognitoUntil = until != null ? DateTime.parse(until) : null;
-          _avatarUrl = resp['avatar_url'] as String?;
+          _avatarUrl = _resolveAvatarUrl(resp['avatar_url'] as String?);
+          _avatarLoadError = false;
+          _showActivity = resp['show_activity'] as bool? ?? false;
 
           debugPrint(
             '[incognito] Loaded: is_incognito=$_isIncognito, until=$_incognitoUntil',
@@ -274,7 +360,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           .from('profiles')
           .update({
             'is_incognito': enabled,
-            'incognito_until': until?.toIso8601String(),
+            'incognito_until': until?.toUtc().toIso8601String(),
           })
           .eq('id', userId);
 
@@ -308,22 +394,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
-        backgroundColor: Colors.grey[900],
         title: Row(
           children: [
             const Icon(Icons.visibility_off, color: Colors.deepPurple),
             const SizedBox(width: 12),
-            const Text('Incognito Mode', style: TextStyle(color: Colors.white)),
+            const Text('Incognito Mode'),
           ],
         ),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text(
-              'How long do you want to be invisible?',
-              style: TextStyle(color: Colors.grey),
-            ),
+            const Text('How long do you want to be invisible?'),
             const SizedBox(height: 16),
             _buildDurationButton('30 Minutes', const Duration(minutes: 30)),
             _buildDurationButton('1 Hour', const Duration(hours: 1)),
@@ -479,7 +561,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               child: Container(
                 padding: const EdgeInsets.all(16),
                 decoration: BoxDecoration(
-                  color: Colors.grey[850],
+                  color: Theme.of(context).colorScheme.surface,
                   borderRadius: BorderRadius.circular(16),
                 ),
                 child: Column(
@@ -488,16 +570,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   children: [
                     Text(
                       'Edit Handle',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 20,
-                        fontWeight: FontWeight.w600,
-                      ),
+                      style: Theme.of(context).textTheme.titleLarge,
                     ),
                     const SizedBox(height: 12),
                     TextField(
                       controller: controller,
-                      style: const TextStyle(color: Colors.white),
                       decoration: InputDecoration(
                         prefixText: '@',
                         prefixStyle: const TextStyle(
@@ -506,16 +583,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           fontSize: 16,
                         ),
                         labelText: 'Handle',
-                        labelStyle: const TextStyle(color: Colors.white70),
                         hintText:
                             'Only lowercase letters, numbers, dot (.), underscore (_) and hyphen (-)',
-                        hintStyle: const TextStyle(color: Colors.white30),
-                        filled: true,
-                        fillColor: Colors.white10,
-                        enabledBorder: OutlineInputBorder(
-                          borderSide: const BorderSide(color: Colors.white24),
-                          borderRadius: BorderRadius.circular(10),
-                        ),
                         focusedBorder: OutlineInputBorder(
                           borderSide: const BorderSide(
                             color: Color(0xFFFF8800),
@@ -539,9 +608,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           onPressed: isBusy
                               ? null
                               : () => Navigator.pop(context),
-                          style: TextButton.styleFrom(
-                            foregroundColor: Colors.white70,
-                          ),
                           child: const Text('Cancel'),
                         ),
                         const SizedBox(width: 8),
@@ -649,19 +715,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final email = user?.email ?? 'Nicht angemeldet';
 
     return Scaffold(
-      backgroundColor: Colors.black,
-      appBar: AppBar(
-        backgroundColor: Colors.black,
-        elevation: 0,
-        title: const Text(
-          'settings.',
-          style: TextStyle(
-            color: Colors.white,
-            fontSize: 26,
-            fontWeight: FontWeight.bold,
-          ),
-        ),
-      ),
+      appBar: AppBar(elevation: 0, title: const Text('settings.')),
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
           : ListView(
@@ -672,11 +726,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   padding: const EdgeInsets.symmetric(horizontal: 16),
                   child: Text(
                     'Visibility',
-                    style: TextStyle(
-                      color: Colors.grey[600],
-                      fontSize: 12,
-                      fontWeight: FontWeight.bold,
-                    ),
+                    style: Theme.of(context).textTheme.labelSmall,
                   ),
                 ),
                 const SizedBox(height: 16),
@@ -714,13 +764,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                 painter: _RadiusSelectorPainter(
                                   kRing: _visibilityRadius,
                                   locked: _isCooldownActive,
+                                  isDark:
+                                      Theme.of(context).brightness ==
+                                      Brightness.dark,
                                 ),
                               ),
                             ),
                             if (_isCooldownActive)
-                              const Icon(
+                              Icon(
                                 Icons.lock,
-                                color: Colors.white38,
+                                color: Theme.of(
+                                  context,
+                                ).colorScheme.onSurface.withValues(alpha: 0.3),
                                 size: 32,
                               ),
                           ],
@@ -734,7 +789,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         style: TextStyle(
                           color: _isCooldownActive
                               ? Colors.orange[400]
-                              : Colors.white,
+                              : Theme.of(context).colorScheme.onSurface,
                           fontSize: 15,
                           fontWeight: FontWeight.w600,
                         ),
@@ -744,7 +799,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         _isCooldownActive
                             ? 'You can adjust your visibility range again after the cooldown.'
                             : 'Drag outward or inward to adjust — friends with a smaller radius may not see you.',
-                        style: TextStyle(color: Colors.grey[600], fontSize: 12),
+                        style: TextStyle(
+                          color: Theme.of(
+                            context,
+                          ).colorScheme.onSurface.withValues(alpha: 0.6),
+                          fontSize: 12,
+                        ),
                         textAlign: TextAlign.center,
                       ),
                     ],
@@ -756,34 +816,26 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   padding: const EdgeInsets.symmetric(horizontal: 16),
                   child: Text(
                     'Privacy',
-                    style: TextStyle(
-                      color: Colors.grey[600],
-                      fontSize: 12,
-                      fontWeight: FontWeight.bold,
-                    ),
+                    style: Theme.of(context).textTheme.labelSmall,
                   ),
                 ),
                 const SizedBox(height: 8),
                 ListTile(
                   leading: Icon(
                     Icons.visibility_off,
-                    color: _isIncognito ? Colors.deepPurple : Colors.white70,
+                    color: _isIncognito ? Colors.deepPurple : null,
                   ),
-                  title: const Text(
-                    'Incognito Mode',
-                    style: TextStyle(color: Colors.white),
-                  ),
+                  title: const Text('Incognito Mode'),
                   subtitle: Text(
                     _getIncognitoStatusText(),
                     style: TextStyle(
-                      color: _isIncognito
-                          ? Colors.deepPurple[200]
-                          : Colors.grey,
+                      color: _isIncognito ? Colors.deepPurple[200] : null,
                     ),
                   ),
                   trailing: Switch(
                     value: _isIncognito,
                     activeThumbColor: Colors.deepPurple,
+                    activeTrackColor: Colors.deepPurple.withValues(alpha: 0.4),
                     onChanged: (value) {
                       if (value) {
                         _showIncognitoDialog();
@@ -793,20 +845,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     },
                   ),
                 ),
-                const Divider(color: Colors.white10),
+                const Divider(),
                 ListTile(
                   leading: const Icon(Icons.shield, color: Color(0xFF4DD0E1)),
-                  title: const Text(
-                    'Safe Zones',
-                    style: TextStyle(color: Colors.white),
-                  ),
+                  title: const Text('Safe Zones'),
                   subtitle: const Text(
                     'Places where you don\'t want to be visible',
-                    style: TextStyle(color: Colors.grey),
                   ),
-                  trailing: const Icon(
+                  trailing: Icon(
                     Icons.arrow_forward_ios,
-                    color: Colors.grey,
+                    color: Theme.of(
+                      context,
+                    ).colorScheme.onSurface.withValues(alpha: 0.4),
                     size: 16,
                   ),
                   onTap: () {
@@ -818,17 +868,45 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     );
                   },
                 ),
+                const Divider(),
+                ListTile(
+                  leading: Icon(
+                    Icons.access_time_rounded,
+                    color: _showActivity ? Colors.green[400] : null,
+                  ),
+                  title: const Text('Activity Status'),
+                  subtitle: Text(
+                    _showActivity
+                        ? 'Others can see that you are an active user'
+                        : 'Activity hidden from others',
+                  ),
+                  trailing: Switch(
+                    value: _showActivity,
+                    activeThumbColor: Colors.green[400],
+                    activeTrackColor: Colors.green[400]!.withValues(alpha: 0.4),
+                    onChanged: (value) async {
+                      final userId =
+                          Supabase.instance.client.auth.currentUser?.id;
+                      if (userId == null) return;
+                      try {
+                        await Supabase.instance.client
+                            .from('profiles')
+                            .update({'show_activity': value})
+                            .eq('id', userId);
+                        if (mounted) setState(() => _showActivity = value);
+                      } catch (e) {
+                        debugPrint('[settings] Error saving activity: $e');
+                      }
+                    },
+                  ),
+                ),
                 const SizedBox(height: 24),
                 // ── Account Section ─────────────────────────────────────
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 16),
                   child: Text(
                     'Account',
-                    style: TextStyle(
-                      color: Colors.grey[600],
-                      fontSize: 12,
-                      fontWeight: FontWeight.bold,
-                    ),
+                    style: Theme.of(context).textTheme.labelSmall,
                   ),
                 ),
                 const SizedBox(height: 8),
@@ -844,74 +922,67 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           ),
                         )
                       : GestureDetector(
-                          onTap: _pickAndUploadAvatar,
-                          child: CircleAvatar(
-                            radius: 20,
-                            backgroundColor: const Color(0xFF311B00),
-                            backgroundImage: _avatarUrl != null
-                                ? NetworkImage(_avatarUrl!)
-                                : null,
-                            child: _avatarUrl == null
-                                ? const Icon(
-                                    Icons.person,
-                                    color: Color(0xFFFF8A00),
-                                    size: 22,
-                                  )
-                                : null,
-                          ),
-                        ),
-                  title: const Text(
-                    'Profile Picture',
-                    style: TextStyle(color: Colors.white),
-                  ),
-                  subtitle: Text(
-                    _avatarUrl != null
-                        ? 'Tap photo to change'
-                        : 'Tap to upload a photo',
-                    style: const TextStyle(color: Colors.grey),
-                  ),
-                  trailing: _avatarUrl == null
-                      ? TextButton(
-                          onPressed: _isUploadingAvatar
-                              ? null
+                          onTap: (_avatarUrl != null && !_avatarLoadError)
+                              ? _viewAvatar
                               : _pickAndUploadAvatar,
-                          child: const Text(
-                            'Upload',
-                            style: TextStyle(color: Color(0xFFFF8800)),
+                          child: Hero(
+                            tag: 'avatar_preview',
+                            child: CircleAvatar(
+                              radius: 20,
+                              backgroundColor: const Color(0xFF311B00),
+                              backgroundImage:
+                                  _avatarUrl != null && !_avatarLoadError
+                                  ? NetworkImage(_avatarUrl!)
+                                  : null,
+                              onBackgroundImageError: _avatarUrl != null
+                                  ? (_, _) {
+                                      if (mounted) {
+                                        setState(() => _avatarLoadError = true);
+                                      }
+                                    }
+                                  : null,
+                              child: _avatarUrl == null || _avatarLoadError
+                                  ? const Icon(
+                                      Icons.person,
+                                      color: Color(0xFFFF8A00),
+                                      size: 22,
+                                    )
+                                  : null,
+                            ),
                           ),
-                        )
-                      : null,
-                ),
-                const SizedBox(height: 8),
-                ListTile(
-                  leading: const Icon(Icons.email, color: Colors.white70),
-                  title: const Text(
-                    'E-Mail',
-                    style: TextStyle(color: Colors.white),
-                  ),
-                  subtitle: Text(
-                    email,
-                    style: const TextStyle(color: Colors.grey),
-                  ),
-                ),
-                const SizedBox(height: 8),
-                ListTile(
-                  leading: const Icon(Icons.person, color: Colors.white70),
-                  title: const Text(
-                    'Handle',
-                    style: TextStyle(color: Colors.white),
-                  ),
-                  subtitle: _isHandleLoading
-                      ? const Text(
-                          'Loading...',
-                          style: TextStyle(color: Colors.grey),
-                        )
-                      : Text(
-                          _handle != null ? '@${_handle!}' : 'Not set',
-                          style: const TextStyle(color: Colors.grey),
                         ),
+                  title: const Text('Profile Picture'),
+                  subtitle: Text(
+                    _avatarUrl != null && !_avatarLoadError
+                        ? 'Tap photo to view'
+                        : 'No photo yet',
+                  ),
+                  trailing: _isUploadingAvatar
+                      ? null
+                      : IconButton(
+                          icon: const Icon(
+                            Icons.edit,
+                            color: Color(0xFFFF8800),
+                          ),
+                          tooltip: 'Change photo',
+                          onPressed: _pickAndUploadAvatar,
+                        ),
+                ),
+                const SizedBox(height: 8),
+                ListTile(
+                  leading: const Icon(Icons.email),
+                  title: const Text('E-Mail'),
+                  subtitle: Text(email),
+                ),
+                const SizedBox(height: 8),
+                ListTile(
+                  leading: const Icon(Icons.person),
+                  title: const Text('Handle'),
+                  subtitle: _isHandleLoading
+                      ? const Text('Loading...')
+                      : Text(_handle != null ? '@${_handle!}' : 'Not set'),
                   trailing: IconButton(
-                    icon: const Icon(Icons.edit, color: Colors.white70),
+                    icon: const Icon(Icons.edit),
                     onPressed: _isHandleLoading
                         ? null
                         : () {
@@ -919,13 +990,55 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           },
                   ),
                 ),
-                const Divider(color: Colors.white10),
+                const Divider(),
                 const ListTile(
-                  leading: Icon(Icons.info_outline, color: Colors.white70),
-                  title: Text('Version', style: TextStyle(color: Colors.white)),
-                  subtitle: Text('1.0.0', style: TextStyle(color: Colors.grey)),
+                  leading: Icon(Icons.info_outline),
+                  title: Text('Version'),
+                  subtitle: Text('1.0.0'),
                 ),
-                const Divider(color: Colors.white10),
+                const Divider(),
+                // ── Appearance Section ──────────────────────────────────
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  child: Text(
+                    'Appearance',
+                    style: Theme.of(context).textTheme.labelSmall,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  child: SegmentedButton<ThemeMode>(
+                    segments: const [
+                      ButtonSegment(
+                        value: ThemeMode.system,
+                        label: Text('System'),
+                        icon: Icon(Icons.brightness_auto),
+                      ),
+                      ButtonSegment(
+                        value: ThemeMode.light,
+                        label: Text('Light'),
+                        icon: Icon(Icons.light_mode),
+                      ),
+                      ButtonSegment(
+                        value: ThemeMode.dark,
+                        label: Text('Dark'),
+                        icon: Icon(Icons.dark_mode),
+                      ),
+                    ],
+                    selected: {_themeMode},
+                    onSelectionChanged: (s) => _saveThemeMode(s.first),
+                    style: ButtonStyle(
+                      iconColor: WidgetStateProperty.resolveWith(
+                        (s) => s.contains(WidgetState.selected)
+                            ? Colors.black
+                            : null,
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 24),
+                const Divider(),
                 ListTile(
                   leading: const Icon(Icons.logout, color: Colors.redAccent),
                   title: const Text(
@@ -936,15 +1049,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     final confirmed = await showDialog<bool>(
                       context: context,
                       builder: (context) => AlertDialog(
-                        backgroundColor: Colors.grey[900],
-                        title: const Text(
-                          'Logout?',
-                          style: TextStyle(color: Colors.white),
-                        ),
-                        content: const Text(
-                          'Do you really want to log out?',
-                          style: TextStyle(color: Colors.grey),
-                        ),
+                        title: const Text('Logout?'),
+                        content: const Text('Do you really want to log out?'),
                         actions: [
                           TextButton(
                             onPressed: () => Navigator.pop(context, false),
@@ -974,11 +1080,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String _radiusLabel(int k) {
     switch (k) {
       case 1:
-        return 'Close — ~500m';
+        return 'Close  ~500m';
       case 3:
-        return 'Wide — ~1km';
+        return 'Wide  ~1km';
       default:
-        return 'Normal — ~800m';
+        return 'Normal  ~800m';
     }
   }
 }
@@ -988,11 +1094,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
 class _RadiusSelectorPainter extends CustomPainter {
   final int kRing;
   final bool locked;
+  final bool isDark;
 
-  const _RadiusSelectorPainter({required this.kRing, this.locked = false});
+  const _RadiusSelectorPainter({
+    required this.kRing,
+    this.locked = false,
+    this.isDark = true,
+  });
 
-  // Returns which ring (0=center, 1=ring1, 2=ring2, 3=ring3) a hex at axial
-  // coords (q, r) belongs to. Uses the Chebyshev distance on the cube grid.
   static int _ringOf(int q, int r) {
     final s = -q - r;
     return ([q.abs(), r.abs(), s.abs()].reduce((a, b) => a > b ? a : b));
@@ -1002,10 +1111,9 @@ class _RadiusSelectorPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     final center = size.center(Offset.zero);
     final side = size.shortestSide * 0.085;
-    final spacingX = side * 1.7320508; // sqrt(3)
+    final spacingX = side * 1.7320508;
     final spacingY = side * 1.5;
 
-    // Draw a 7×7 axial grid (kRing 0..3).
     for (var q = -3; q <= 3; q++) {
       for (var r = (-3 - q).clamp(-3, 3); r <= (3 - q).clamp(-3, 3); r++) {
         final ring = _ringOf(q, r);
@@ -1023,20 +1131,29 @@ class _RadiusSelectorPainter extends CustomPainter {
 
         if (isCore) {
           fillColor = locked
-              ? const Color(0xFF555555)
+              ? (isDark ? const Color(0xFF555555) : const Color(0xFFAAAAAA))
               : const Color(0xFFFF8A00);
           borderColor = locked
-              ? const Color(0xFF777777)
+              ? (isDark ? const Color(0xFF777777) : const Color(0xFFBBBBBB))
               : const Color(0xFFFF8A00);
         } else if (active) {
-          // Fade from bright to dim as ring increases.
           final opacity = locked ? 0.25 : (1.0 - (ring - 1) * 0.25);
-          fillColor = Color.fromRGBO(
-            (0x31 + ((0xFF - 0x31) * opacity * 0.18)).round(),
-            0x1B,
-            0x00,
-            1,
-          );
+          if (isDark) {
+            fillColor = Color.fromRGBO(
+              (0x31 + ((0xFF - 0x31) * opacity * 0.18)).round(),
+              0x1B,
+              0x00,
+              1,
+            );
+          } else {
+            // Warm amber tint for light mode active rings
+            fillColor = Color.fromRGBO(
+              0xFF,
+              (0xC0 * opacity).round().clamp(0, 255),
+              (0x40 * opacity).round().clamp(0, 255),
+              opacity * 0.25 + 0.05,
+            );
+          }
           borderColor = Color.fromRGBO(
             0xFF,
             (0x8A * opacity).round(),
@@ -1044,8 +1161,10 @@ class _RadiusSelectorPainter extends CustomPainter {
             opacity * 0.85 + 0.15,
           );
         } else {
-          fillColor = const Color(0xFF111111);
-          borderColor = Colors.white10;
+          fillColor = isDark
+              ? const Color(0xFF111111)
+              : const Color(0xFFD4D4D8);
+          borderColor = isDark ? Colors.white10 : Colors.black12;
         }
 
         final path = _hexPath(cellCenter, side);
@@ -1069,10 +1188,11 @@ class _RadiusSelectorPainter extends CustomPainter {
         center.dx + side * cos(angle),
         center.dy + side * sin(angle),
       );
-      if (i == 0)
+      if (i == 0) {
         path.moveTo(pt.dx, pt.dy);
-      else
+      } else {
         path.lineTo(pt.dx, pt.dy);
+      }
     }
     path.close();
     return path;
@@ -1080,5 +1200,5 @@ class _RadiusSelectorPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _RadiusSelectorPainter old) =>
-      old.kRing != kRing || old.locked != locked;
+      old.kRing != kRing || old.locked != locked || old.isDark != isDark;
 }
