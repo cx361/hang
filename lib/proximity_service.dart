@@ -1,13 +1,29 @@
 import 'dart:async';
 import 'dart:io' show Platform;
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_apns_only/flutter_apns_only.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 // In debug builds use a short cooldown so testing is easy.
-const _kCooldown = kDebugMode ? Duration(minutes: 1) : Duration(hours: 3);
+const _kCooldown = kDebugMode ? Duration(minutes: 1) : Duration(hours: 6);
+
+// How long a friend must be *absent* from polls before we consider them
+// "departed".  A single missed poll (GPS jitter, brief background) won't
+// clear them from _lastNearbyIds, preventing a spurious re-arrival ping.
+const _kDepartureGrace = kDebugMode
+    ? Duration(seconds: 30)
+    : Duration(minutes: 5);
+
+// Maximum age of a friend's last-known location before we refuse to ping.
+// If a friend's phone died / went offline, their stale H3 hex can linger in
+// the DB and keep matching our kRing.  We skip the ping until they update.
+const _kLocationMaxAge = kDebugMode
+    ? Duration(minutes: 60)
+    : Duration(hours: 4);
 
 /// Handles symmetric proximity notifications between two users.
 ///
@@ -57,6 +73,25 @@ class ProximityService {
   // pair_keys that this client just upserted — used to suppress the echo
   // notification that arrives via Realtime for the local user.
   final _selfTriggered = <String>{};
+
+  // Maps friend ID → last time they appeared in a proximity poll.
+  // A friend is only considered "departed" (removed from the nearby set) once
+  // they have been absent for longer than _kDepartureGrace.  This prevents
+  // GPS jitter or a brief app-background from resetting the arrival guard and
+  // causing a spurious re-ping while two people are still hanging out.
+  final _lastSeenAt = <String, DateTime>{};
+
+  // Cached silent-zone status for the current user.  Updated by
+  // checkAndPing() and updateSilentZoneStatus() so that _onEvent() can
+  // suppress foreground notifications when the user is in a silent zone.
+  bool _isCurrentUserInSilentZone = false;
+
+  /// Call this whenever the user's silent-zone status changes (e.g. after
+  /// _loadSilentZoneStatus in main.dart) so that Realtime-triggered
+  /// notifications can be suppressed even between proximity polls.
+  void updateSilentZoneStatus(bool isInSilentZone) {
+    _isCurrentUserInSilentZone = isInSilentZone;
+  }
 
   // ── init ──────────────────────────────────────────────────────────────────
 
@@ -153,8 +188,11 @@ class ProximityService {
     if (!Platform.isIOS) return;
 
     _apnsConnector = ApnsPushConnectorOnly();
-    // Request permission and start listening for the device token.
-    _apnsConnector!.requestNotificationPermissions();
+    // Do NOT call requestNotificationPermissions() here — flutter_local_notifications
+    // already requests alert/sound permissions, and calling it from a background
+    // context causes FlutterEngine to assert on Thread 2 (flutter_apns_only bug).
+    // configureApns() triggers UIApplication.registerForRemoteNotifications() which
+    // is sufficient to obtain the APNs device token.
     _apnsConnector!.configureApns(
       // When the app is foregrounded, Realtime already shows a local
       // notification for the same event — suppress the APNs banner here
@@ -351,6 +389,15 @@ class ProximityService {
   }
 
   void _onEvent(PostgresChangePayload payload, String currentUserId) {
+    // Delegate to async handler so we can do a live DB read before
+    // deciding whether to show the notification.
+    _handleProximityEvent(payload, currentUserId);
+  }
+
+  Future<void> _handleProximityEvent(
+    PostgresChangePayload payload,
+    String currentUserId,
+  ) async {
     final record = payload.newRecord;
     final pairKey = record['pair_key'] as String?;
     if (pairKey == null) return;
@@ -358,6 +405,32 @@ class ProximityService {
     // Self-triggered pings: the sender already showed a local notification
     // in _tryPing — skip to avoid a duplicate.
     if (_selfTriggered.remove(pairKey)) return;
+
+    // Read is_in_silent_zone live from the DB at the moment the notification
+    // would fire. The in-memory flag can be stale at startup (set
+    // asynchronously), so we always go to the source.
+    try {
+      final profile = await Supabase.instance.client
+          .from('profiles')
+          .select('is_in_silent_zone')
+          .eq('id', currentUserId)
+          .single();
+      if ((profile['is_in_silent_zone'] as bool?) ?? false) {
+        _log(
+          '[proximity] Realtime ping suppressed — current user in silent zone',
+        );
+        return;
+      }
+    } catch (e) {
+      // DB read failed — fall back to the in-memory cache.
+      _log('[proximity] Silent zone DB check failed ($e) — using cached value');
+      if (_isCurrentUserInSilentZone) {
+        _log(
+          '[proximity] Realtime ping suppressed — current user in silent zone (cached)',
+        );
+        return;
+      }
+    }
 
     // The recipient is notified via APNs (Edge Function) when backgrounded.
     // When the app IS in the foreground, show a local notification too so
@@ -388,12 +461,16 @@ class ProximityService {
   Future<void> _showNotification(String handle) async {
     // Ensure the plugin is ready even if initialize() wasn't awaited.
     if (!_initialized) await initialize();
-    const android = AndroidNotificationDetails(
+    // Ripple pattern: strong → gap → medium → gap → soft.
+    final vibrationPattern = Int64List.fromList([0, 120, 80, 60, 80, 30]);
+    final android = AndroidNotificationDetails(
       _channelId,
       _channelName,
       channelDescription: _channelDescription,
       importance: Importance.high,
       priority: Priority.high,
+      enableVibration: true,
+      vibrationPattern: vibrationPattern,
     );
     const apple = DarwinNotificationDetails(
       presentAlert: true,
@@ -403,28 +480,123 @@ class ProximityService {
       // timeSensitive breaks through Focus/DND on iOS 15+
       interruptionLevel: InterruptionLevel.timeSensitive,
     );
-    const details = NotificationDetails(
+    final details = NotificationDetails(
       android: android,
       iOS: apple,
       macOS: apple,
     );
 
     final id = _notifId++ & 0x7FFFFFFF;
-    await _notifications.show(id, 'hang.', '$handle is nearby! 👋', details);
+    await _notifications.show(
+      id,
+      'hang.',
+      'hey! @$handle\'s close! 🫧',
+      details,
+    );
     _log('[proximity] Notification shown for $handle');
+
+    // Foreground haptic: ripple (strong → medium → light, fading like a ripple).
+    HapticFeedback.heavyImpact();
+    await Future.delayed(const Duration(milliseconds: 200));
+    HapticFeedback.mediumImpact();
+    await Future.delayed(const Duration(milliseconds: 140));
+    HapticFeedback.lightImpact();
   }
 
   // ── Ping logic ────────────────────────────────────────────────────────────
 
-  /// Call this after detecting nearby friends.
-  /// [nearbyFriends] must contain maps with at least `'id'` and `'handle'`.
-  Future<void> checkAndPing(List<Map<String, dynamic>> nearbyFriends) async {
+  /// Call this after each proximity poll — pass the full current nearby list
+  /// (may be empty). Only friends who were NOT nearby on a recent previous
+  /// call (i.e. genuinely just arrived) trigger a ping. Friends who have been
+  /// continuously in range are skipped, even across brief GPS gaps, thanks to
+  /// the [_kDepartureGrace] window in [_lastSeenAt].
+  ///
+  /// [currentUserInSilentZone]: pass the caller's current silent-zone flag.
+  /// When true, all pings are suppressed in both directions for this tick.
+  Future<void> checkAndPing(
+    List<Map<String, dynamic>> nearbyFriends, {
+    bool currentUserInSilentZone = false,
+  }) async {
+    // Cache for Realtime event suppression between polls.
+    _isCurrentUserInSilentZone = currentUserInSilentZone;
+
     final currentUserId = Supabase.instance.client.auth.currentUser?.id;
     if (currentUserId == null) return;
+
+    final now = DateTime.now();
+    final currentIds = nearbyFriends
+        .map((f) => f['id'] as String?)
+        .whereType<String>()
+        .toSet();
+
+    // Snapshot who was "nearby" BEFORE updating timestamps for this tick.
+    // A friend is considered continuously nearby if they appear in this
+    // snapshot (they were seen recently enough to still be in the map).
+    final previouslyNearby = _lastSeenAt.keys.toSet();
+
+    // Update last-seen timestamps for everyone currently visible.
+    for (final id in currentIds) {
+      _lastSeenAt[id] = now;
+    }
+
+    // Evict friends who have been absent longer than the departure grace
+    // period.  This prevents GPS jitter / a brief app-background from
+    // treating them as "departed" and causing a spurious re-arrival ping.
+    _lastSeenAt.removeWhere(
+      (id, lastSeen) => now.difference(lastSeen) > _kDepartureGrace,
+    );
+
+    // If the current user is in a silent zone, skip all pings this tick but
+    // still maintain _lastSeenAt so future arrivals are detected correctly.
+    if (currentUserInSilentZone) {
+      _log('[proximity] Skipping all pings — current user in silent zone');
+      return;
+    }
 
     for (final friend in nearbyFriends) {
       final friendId = friend['id'] as String?;
       if (friendId == null) continue;
+
+      // Skip friends who were already tracked as nearby before this tick —
+      // they haven't genuinely re-arrived.
+      if (previouslyNearby.contains(friendId)) continue;
+
+      // Skip friends whose location is stale (phone died, app killed, etc.).
+      // We still let _lastSeenAt track them so a genuine re-arrival after
+      // they come back online is detected correctly.
+      final updatedAtStr = friend['updated_at'] as String?;
+      if (updatedAtStr != null) {
+        try {
+          final locationAge = now.toUtc().difference(
+            DateTime.parse(updatedAtStr).toUtc(),
+          );
+          if (locationAge > _kLocationMaxAge) {
+            _log(
+              '[proximity] Skipping ping for ${friend['handle']} — '
+              'location is ${locationAge.inMinutes}min old (>${_kLocationMaxAge.inMinutes}min)',
+            );
+            continue;
+          }
+        } catch (_) {
+          // Unparseable timestamp — treat as stale to be safe.
+          _log(
+            '[proximity] Skipping ping for ${friend['handle']} — '
+            'could not parse updated_at: $updatedAtStr',
+          );
+          continue;
+        }
+      }
+
+      // Silent zone: if the friend doesn't want pings, skip them too.
+      final friendInSilentZone =
+          (friend['is_in_silent_zone'] as bool?) ?? false;
+      if (friendInSilentZone) {
+        _log(
+          '[proximity] Skipping ping for ${friend['handle']} — friend in silent zone',
+        );
+        continue;
+      }
+
       final handle = (friend['handle'] as String?) ?? 'Jemand';
       await _tryPing(currentUserId, friendId, handle);
     }

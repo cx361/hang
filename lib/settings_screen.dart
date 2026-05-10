@@ -7,7 +7,7 @@ import 'package:image_cropper/image_cropper.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'app_theme.dart';
-import 'safe_zones_screen.dart';
+import 'zones_screen.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key, this.onRadiusChanged});
@@ -118,7 +118,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               child: Image.network(
                 _avatarUrl!,
                 fit: BoxFit.contain,
-                errorBuilder: (_, _, _) => const Icon(
+                errorBuilder: (_, __, ___) => const Icon(
                   Icons.broken_image,
                   color: Colors.white54,
                   size: 64,
@@ -360,7 +360,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           .from('profiles')
           .update({
             'is_incognito': enabled,
-            'incognito_until': until?.toUtc().toIso8601String(),
+            'incognito_until': until?.toIso8601String(),
           })
           .eq('id', userId);
 
@@ -834,7 +834,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                   trailing: Switch(
                     value: _isIncognito,
-                    activeThumbColor: Colors.deepPurple,
+                    activeColor: Colors.deepPurple,
                     activeTrackColor: Colors.deepPurple.withValues(alpha: 0.4),
                     onChanged: (value) {
                       if (value) {
@@ -847,8 +847,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
                 const Divider(),
                 ListTile(
-                  leading: const Icon(Icons.shield, color: Color(0xFF4DD0E1)),
-                  title: const Text('Safe Zones'),
+                  leading: ShaderMask(
+                    blendMode: BlendMode.srcIn,
+                    shaderCallback: (bounds) => const LinearGradient(
+                      begin: Alignment.centerLeft,
+                      end: Alignment.centerRight,
+                      stops: [0.5, 0.5],
+                      colors: [Color(0xFF4DD0E1), Color(0xFF5B9BD5)],
+                    ).createShader(bounds),
+                    child: const Icon(Icons.shield),
+                  ),
+                  title: const Text('Zones'),
                   subtitle: const Text(
                     'Places where you don\'t want to be visible',
                   ),
@@ -882,7 +891,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                   trailing: Switch(
                     value: _showActivity,
-                    activeThumbColor: Colors.green[400],
+                    activeColor: Colors.green[400],
                     activeTrackColor: Colors.green[400]!.withValues(alpha: 0.4),
                     onChanged: (value) async {
                       final userId =
@@ -935,10 +944,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                   ? NetworkImage(_avatarUrl!)
                                   : null,
                               onBackgroundImageError: _avatarUrl != null
-                                  ? (_, _) {
-                                      if (mounted) {
+                                  ? (_, __) {
+                                      if (mounted)
                                         setState(() => _avatarLoadError = true);
-                                      }
                                     }
                                   : null,
                               child: _avatarUrl == null || _avatarLoadError

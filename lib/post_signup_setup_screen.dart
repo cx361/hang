@@ -2,7 +2,7 @@ import 'dart:math' show cos, pi, sin, sqrt;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
-import 'safe_zones_screen.dart';
+import 'zones_screen.dart';
 
 class PostSignupSetupScreen extends StatefulWidget {
   final VoidCallback onDone;

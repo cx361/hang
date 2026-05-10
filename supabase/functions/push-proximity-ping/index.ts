@@ -69,7 +69,7 @@ Deno.serve(async (req: Request) => {
   for (const recipientId of recipientIds) {
     const { data: profile, error } = await supabase
       .from("profiles")
-      .select("apns_token")
+      .select("apns_token, is_in_silent_zone")
       .eq("id", recipientId)
       .maybeSingle();
 
@@ -78,10 +78,29 @@ Deno.serve(async (req: Request) => {
       continue;
     }
 
+    // Silent zone: recipient has opted out of all pings.
+    if (profile.is_in_silent_zone) {
+      results.push(`${recipientId}: skipped (silent zone)`);
+      continue;
+    }
+
+    // Also skip if the sender is in a silent zone (check sender's profile).
+    if (triggeredBy) {
+      const { data: senderProfile } = await supabase
+        .from("profiles")
+        .select("is_in_silent_zone")
+        .eq("id", triggeredBy)
+        .maybeSingle();
+      if (senderProfile?.is_in_silent_zone) {
+        results.push(`${recipientId}: skipped (sender in silent zone)`);
+        continue;
+      }
+    }
+
     try {
       const { status, body } = await sendApnsPush(profile.apns_token, {
         title: "hang.",
-        body: `${senderHandle} is nearby! 👋`,
+        body: `hey! @${senderHandle}'s close! 🫧`,
       });
       results.push(`${recipientId}: APNs ${status} ${body}`);
     } catch (err) {

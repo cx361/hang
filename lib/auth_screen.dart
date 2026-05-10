@@ -81,6 +81,14 @@ class _AuthScreenState extends State<AuthScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final onBg = isDark ? Colors.white : Colors.black87;
+    final subtle = isDark ? Colors.white60 : Colors.black54;
+    final borderColor = isDark ? Colors.white30 : Colors.black26;
+    final fillColor = isDark
+        ? Colors.white.withAlpha(10)
+        : Colors.grey.shade100;
+
     return Scaffold(
       body: SafeArea(
         child: Center(
@@ -101,7 +109,7 @@ class _AuthScreenState extends State<AuthScreen> {
                 const SizedBox(height: 8),
                 Text(
                   _isLogin ? 'Welcome back' : 'Create your account',
-                  style: const TextStyle(color: Colors.white70, fontSize: 18),
+                  style: TextStyle(color: subtle, fontSize: 18),
                 ),
                 const SizedBox(height: 48),
 
@@ -110,12 +118,12 @@ class _AuthScreenState extends State<AuthScreen> {
                   controller: _emailController,
                   keyboardType: TextInputType.emailAddress,
                   autocorrect: false,
-                  style: const TextStyle(color: Colors.white),
+                  style: TextStyle(color: onBg),
                   decoration: InputDecoration(
                     labelText: 'Email',
-                    labelStyle: const TextStyle(color: Colors.white60),
+                    labelStyle: TextStyle(color: subtle),
                     enabledBorder: OutlineInputBorder(
-                      borderSide: const BorderSide(color: Colors.white30),
+                      borderSide: BorderSide(color: borderColor),
                       borderRadius: BorderRadius.circular(12),
                     ),
                     focusedBorder: OutlineInputBorder(
@@ -123,7 +131,7 @@ class _AuthScreenState extends State<AuthScreen> {
                       borderRadius: BorderRadius.circular(12),
                     ),
                     filled: true,
-                    fillColor: Colors.white.withAlpha(10),
+                    fillColor: fillColor,
                   ),
                 ),
                 const SizedBox(height: 16),
@@ -133,12 +141,12 @@ class _AuthScreenState extends State<AuthScreen> {
                   controller: _passwordController,
                   obscureText: true,
                   autocorrect: false,
-                  style: const TextStyle(color: Colors.white),
+                  style: TextStyle(color: onBg),
                   decoration: InputDecoration(
                     labelText: 'Password',
-                    labelStyle: const TextStyle(color: Colors.white60),
+                    labelStyle: TextStyle(color: subtle),
                     enabledBorder: OutlineInputBorder(
-                      borderSide: const BorderSide(color: Colors.white30),
+                      borderSide: BorderSide(color: borderColor),
                       borderRadius: BorderRadius.circular(12),
                     ),
                     focusedBorder: OutlineInputBorder(
@@ -146,7 +154,7 @@ class _AuthScreenState extends State<AuthScreen> {
                       borderRadius: BorderRadius.circular(12),
                     ),
                     filled: true,
-                    fillColor: Colors.white.withAlpha(10),
+                    fillColor: fillColor,
                   ),
                   onSubmitted: (_) => _handleAuth(),
                 ),
@@ -215,7 +223,7 @@ class _AuthScreenState extends State<AuthScreen> {
                     _isLogin
                         ? 'No account yet? Sign Up'
                         : 'Already have an account? Login',
-                    style: const TextStyle(color: Colors.white60),
+                    style: TextStyle(color: subtle),
                   ),
                 ),
               ],

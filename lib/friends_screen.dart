@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'profile_screen.dart';
 
@@ -20,6 +21,7 @@ class _FriendsScreenState extends State<FriendsScreen>
   List<Map<String, dynamic>> _friendsList = [];
   List<Map<String, dynamic>> _sentRequests = [];
 
+  final _shareButtonKey = GlobalKey();
   Timer? _searchDebounce;
   String? _currentUserId;
   bool _isIncognito = false;
@@ -466,7 +468,9 @@ class _FriendsScreenState extends State<FriendsScreen>
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      resizeToAvoidBottomInset: false,
       appBar: AppBar(elevation: 0, title: const Text('friends.')),
+
       body: Column(
         children: [
           Material(
@@ -623,15 +627,9 @@ class _FriendsScreenState extends State<FriendsScreen>
         ),
         Expanded(
           child: _searchResults.isEmpty
-              ? Center(
-                  child: Text(
-                    _isIncognito
-                        ? ''
-                        : (_searchController.text.isEmpty
-                              ? 'Enter a handle to search'
-                              : 'No users found'),
-                  ),
-                )
+              ? _searchController.text.isEmpty && !_isIncognito
+                    ? _buildShareHangPrompt()
+                    : Center(child: Text(_isIncognito ? '' : 'No users found'))
               : ListView.builder(
                   itemCount: _searchResults.length,
                   itemBuilder: (context, index) {
@@ -698,6 +696,48 @@ class _FriendsScreenState extends State<FriendsScreen>
                 ),
         ),
       ],
+    );
+  }
+
+  Widget _buildShareHangPrompt() {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.people_outline, size: 56, color: Colors.grey),
+            const SizedBox(height: 16),
+            const Text(
+              'Find your friends',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'Search by handle to add friends, or invite someone to hang.',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.grey),
+            ),
+            const SizedBox(height: 24),
+            ElevatedButton.icon(
+              key: _shareButtonKey,
+              onPressed: () {
+                final box =
+                    _shareButtonKey.currentContext?.findRenderObject()
+                        as RenderBox?;
+                Share.share(
+                  'Hey! Join me on hang. — the app that lets you know when friends are nearby. Download it here: https://hangsocial.app',
+                  sharePositionOrigin: box != null
+                      ? box.localToGlobal(Offset.zero) & box.size
+                      : null,
+                );
+              },
+              icon: const Icon(Icons.share),
+              label: const Text('Invite a friend'),
+            ),
+          ],
+        ),
+      ),
     );
   }
 

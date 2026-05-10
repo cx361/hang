@@ -1,8 +1,55 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'proximity_service.dart';
 import 'package:h3_flutter/h3_flutter.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart' as latlong;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Zone configuration — one instance per zone type
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _ZoneConfig {
+  const _ZoneConfig({
+    required this.table,
+    required this.profileColumn,
+    required this.accent,
+    required this.typeLabel,
+    required this.description,
+    required this.icon,
+  });
+
+  final String table;
+  final String profileColumn;
+  final Color accent;
+  final String typeLabel;
+  final String description;
+  final IconData icon;
+}
+
+const _safeConfig = _ZoneConfig(
+  table: 'safe_zones',
+  profileColumn: 'is_in_safe_zone',
+  accent: Color(0xFF4DD0E1),
+  typeLabel: 'Safe Zone',
+  description:
+      'Safe Zones are places like home or office where you become invisible to friends.',
+  icon: Icons.shield,
+);
+
+const _silentConfig = _ZoneConfig(
+  table: 'silent_zones',
+  profileColumn: 'is_in_silent_zone',
+  accent: Color(0xFF5B9BD5),
+  typeLabel: 'Silent Zone',
+  description:
+      'Silent Zones mute all pings in both directions — you stay visible on the map, just no notifications.',
+  icon: Icons.notifications_off,
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Combined zones screen with Safe / Silent tabs
+// ─────────────────────────────────────────────────────────────────────────────
 
 class SafeZonesScreen extends StatefulWidget {
   const SafeZonesScreen({super.key});
@@ -11,115 +58,177 @@ class SafeZonesScreen extends StatefulWidget {
   State<SafeZonesScreen> createState() => _SafeZonesScreenState();
 }
 
-class _SafeZonesScreenState extends State<SafeZonesScreen> {
-  List<Map<String, dynamic>> _safeZones = [];
-  bool _isLoading = true;
+class _SafeZonesScreenState extends State<SafeZonesScreen>
+    with SingleTickerProviderStateMixin {
+  late final TabController _tabController;
 
   @override
   void initState() {
     super.initState();
-    _loadSafeZones();
+    _tabController = TabController(length: 2, vsync: this);
   }
 
-  Future<void> _loadSafeZones() async {
+  @override
+  void dispose() {
+    _tabController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        elevation: 0,
+        title: const Text(
+          'zones.',
+          style: TextStyle(
+            color: Colors.white,
+            fontSize: 26,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+        bottom: TabBar(
+          controller: _tabController,
+          indicatorColor: Colors.white,
+          labelColor: Colors.white,
+          unselectedLabelColor: Colors.grey,
+          tabs: const [
+            Tab(text: 'Safe Zones'),
+            Tab(text: 'Silent Zones'),
+          ],
+        ),
+      ),
+      body: TabBarView(
+        controller: _tabController,
+        children: const [
+          _ZoneTabView(config: _safeConfig),
+          _ZoneTabView(config: _silentConfig),
+        ],
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tab content: list + add/delete for one zone type
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _ZoneTabView extends StatefulWidget {
+  const _ZoneTabView({required this.config});
+  final _ZoneConfig config;
+
+  @override
+  State<_ZoneTabView> createState() => _ZoneTabViewState();
+}
+
+class _ZoneTabViewState extends State<_ZoneTabView>
+    with AutomaticKeepAliveClientMixin {
+  List<Map<String, dynamic>> _zones = [];
+  bool _isLoading = true;
+
+  @override
+  bool get wantKeepAlive => true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadZones();
+  }
+
+  Future<void> _loadZones() async {
     final userId = Supabase.instance.client.auth.currentUser?.id;
     if (userId == null) return;
 
     try {
       final resp = await Supabase.instance.client
-          .from('safe_zones')
+          .from(widget.config.table)
           .select('id, name, h3_index_res9, created_at')
           .eq('user_id', userId)
           .order('created_at', ascending: false);
 
       if (mounted) {
         setState(() {
-          _safeZones = resp.cast<Map<String, dynamic>>();
+          _zones = resp.cast<Map<String, dynamic>>();
           _isLoading = false;
         });
       }
     } catch (e) {
-      debugPrint('[safe_zones] Error loading: $e');
+      debugPrint('[${widget.config.table}] Error loading: $e');
       if (mounted) {
-        setState(() {
-          _isLoading = false;
-        });
+        setState(() => _isLoading = false);
         ScaffoldMessenger.of(
           context,
-        ).showSnackBar(SnackBar(content: Text('Fehler beim Laden: $e')));
+        ).showSnackBar(SnackBar(content: Text('Error loading: $e')));
       }
     }
   }
 
-  Future<void> _addSafeZone() async {
+  Future<void> _addZone() async {
     final result = await Navigator.push<Map<String, dynamic>>(
       context,
-      MaterialPageRoute(builder: (context) => const _AddSafeZoneScreen()),
+      MaterialPageRoute(builder: (_) => _AddZoneScreen(config: widget.config)),
     );
 
-    if (result != null && mounted) {
-      final userId = Supabase.instance.client.auth.currentUser?.id;
-      if (userId == null) return;
+    if (result == null || !mounted) return;
+    final userId = Supabase.instance.client.auth.currentUser?.id;
+    if (userId == null) return;
 
-      try {
-        // Join multiple H3 indices with comma
-        final h3Indices = result['h3_indices'] as List<String>;
-        final h3IndexStr = h3Indices.join(',');
+    try {
+      final h3Indices = result['h3_indices'] as List<String>;
+      await Supabase.instance.client.from(widget.config.table).insert({
+        'user_id': userId,
+        'name': result['name'],
+        'h3_index_res9': h3Indices.join(','),
+      });
 
-        await Supabase.instance.client.from('safe_zones').insert({
-          'user_id': userId,
-          'name': result['name'],
-          'h3_index_res9': h3IndexStr,
-        });
+      await _reevaluateStatus();
 
-        await _reevaluateSafeZoneStatus();
-
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(
-                'Safe Zone with ${h3Indices.length} ${h3Indices.length == 1 ? "field" : "fields"} added! ✓',
-              ),
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              '${widget.config.typeLabel} with ${h3Indices.length} '
+              '${h3Indices.length == 1 ? "field" : "fields"} added! ✓',
             ),
-          );
-          _loadSafeZones();
-        }
-      } catch (e) {
-        debugPrint('[safe_zones] Error adding: $e');
-        if (mounted) {
-          ScaffoldMessenger.of(
-            context,
-          ).showSnackBar(SnackBar(content: Text('Error adding: $e')));
-        }
+          ),
+        );
+        _loadZones();
+      }
+    } catch (e) {
+      debugPrint('[${widget.config.table}] Error adding: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Error adding: $e')));
       }
     }
   }
 
-  /// After deleting a safe zone, re-check whether the user's current hex is
-  /// still inside any *remaining* zone and patch profiles.is_in_safe_zone.
-  Future<void> _reevaluateSafeZoneStatus() async {
+  /// After a create or delete, re-check whether the current hex is still
+  /// inside any remaining zone and update the cached profile flag.
+  Future<void> _reevaluateStatus() async {
     final userId = Supabase.instance.client.auth.currentUser?.id;
     if (userId == null) return;
     try {
-      // Fetch current hex and remaining safe zones sequentially (different return types).
       final profileResp = await Supabase.instance.client
           .from('profiles')
           .select('last_h3_index_res9')
           .eq('id', userId)
           .single();
-      final remainingZones = await Supabase.instance.client
-          .from('safe_zones')
+      final remaining = await Supabase.instance.client
+          .from(widget.config.table)
           .select('h3_index_res9')
           .eq('user_id', userId);
 
       final currentHex = profileResp['last_h3_index_res9'] as String?;
-
-      bool isInSafeZone = false;
+      bool isInZone = false;
       if (currentHex != null) {
-        for (final zone in remainingZones) {
+        for (final zone in remaining) {
           final hexes = (zone['h3_index_res9'] as String).split(',');
           if (hexes.contains(currentHex)) {
-            isInSafeZone = true;
+            isInZone = true;
             break;
           }
         }
@@ -127,23 +236,29 @@ class _SafeZonesScreenState extends State<SafeZonesScreen> {
 
       await Supabase.instance.client
           .from('profiles')
-          .update({'is_in_safe_zone': isInSafeZone})
+          .update({widget.config.profileColumn: isInZone})
           .eq('id', userId);
 
-      debugPrint('[safe_zones] Re-evaluated is_in_safe_zone=$isInSafeZone');
+      if (widget.config.table == 'silent_zones') {
+        ProximityService.instance.updateSilentZoneStatus(isInZone);
+      }
+
+      debugPrint(
+        '[${widget.config.table}] Re-evaluated ${widget.config.profileColumn}=$isInZone',
+      );
     } catch (e) {
-      debugPrint('[safe_zones] Error re-evaluating safe zone status: $e');
+      debugPrint('[${widget.config.table}] Error re-evaluating status: $e');
     }
   }
 
-  Future<void> _deleteSafeZone(String id, String name) async {
+  Future<void> _deleteZone(String id, String name) async {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         backgroundColor: Colors.grey[900],
-        title: const Text(
-          'Delete Safe Zone?',
-          style: TextStyle(color: Colors.white),
+        title: Text(
+          'Delete ${widget.config.typeLabel}?',
+          style: const TextStyle(color: Colors.white),
         ),
         content: Text(
           'Do you really want to delete "$name"?',
@@ -163,91 +278,80 @@ class _SafeZonesScreenState extends State<SafeZonesScreen> {
       ),
     );
 
-    if (confirmed == true) {
-      try {
-        await Supabase.instance.client.from('safe_zones').delete().eq('id', id);
-        await _reevaluateSafeZoneStatus();
+    if (confirmed != true) return;
 
-        if (mounted) {
-          ScaffoldMessenger.of(
-            context,
-          ).showSnackBar(const SnackBar(content: Text('Safe Zone deleted')));
-          _loadSafeZones();
-        }
-      } catch (e) {
-        debugPrint('[safe_zones] Error deleting: $e');
-        if (mounted) {
-          ScaffoldMessenger.of(
-            context,
-          ).showSnackBar(SnackBar(content: Text('Error deleting: $e')));
-        }
+    try {
+      await Supabase.instance.client
+          .from(widget.config.table)
+          .delete()
+          .eq('id', id);
+      await _reevaluateStatus();
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('${widget.config.typeLabel} deleted')),
+        );
+        _loadZones();
+      }
+    } catch (e) {
+      debugPrint('[${widget.config.table}] Error deleting: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Error deleting: $e')));
       }
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    super.build(context);
+    final accent = widget.config.accent;
+
     return Scaffold(
       backgroundColor: Colors.black,
-      appBar: AppBar(
-        backgroundColor: Colors.black,
-        elevation: 0,
-        title: const Text(
-          'safe zones.',
-          style: TextStyle(
-            color: Colors.white,
-            fontSize: 26,
-            fontWeight: FontWeight.bold,
-          ),
-        ),
-      ),
       body: Column(
         children: [
-          // Info Banner
+          // Info banner
           Container(
             padding: const EdgeInsets.all(16),
             margin: const EdgeInsets.all(16),
             decoration: BoxDecoration(
-              color: const Color(0xFF4DD0E1).withValues(alpha: 0.1),
-              border: Border.all(
-                color: const Color(0xFF4DD0E1).withValues(alpha: 0.3),
-              ),
+              color: accent.withValues(alpha: 0.1),
+              border: Border.all(color: accent.withValues(alpha: 0.3)),
               borderRadius: BorderRadius.circular(12),
             ),
             child: Row(
               children: [
-                const Icon(Icons.info_outline, color: Color(0xFF4DD0E1)),
+                Icon(Icons.info_outline, color: accent),
                 const SizedBox(width: 12),
                 Expanded(
                   child: Text(
-                    'Safe Zones are places like home, office or gym where you don\'t want to be visible to friends.',
-                    style: TextStyle(
-                      color: const Color(0xFF4DD0E1),
-                      fontSize: 13,
-                    ),
+                    widget.config.description,
+                    style: TextStyle(color: accent, fontSize: 13),
                   ),
                 ),
               ],
             ),
           ),
 
-          // List of Safe Zones
+          // Zone list
           Expanded(
             child: _isLoading
                 ? const Center(child: CircularProgressIndicator())
-                : _safeZones.isEmpty
+                : _zones.isEmpty
                 ? Center(
                     child: Column(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
                         Icon(
-                          Icons.shield_outlined,
+                          widget.config.icon,
                           size: 64,
                           color: Colors.grey[700],
                         ),
                         const SizedBox(height: 16),
                         Text(
-                          'Noch keine Safe Zones',
+                          'No ${widget.config.typeLabel}s yet',
                           style: TextStyle(
                             color: Colors.grey[600],
                             fontSize: 16,
@@ -255,7 +359,7 @@ class _SafeZonesScreenState extends State<SafeZonesScreen> {
                         ),
                         const SizedBox(height: 8),
                         Text(
-                          'Add a Safe Zone',
+                          'Tap + to add one',
                           style: TextStyle(
                             color: Colors.grey[700],
                             fontSize: 14,
@@ -265,9 +369,9 @@ class _SafeZonesScreenState extends State<SafeZonesScreen> {
                     ),
                   )
                 : ListView.builder(
-                    itemCount: _safeZones.length,
+                    itemCount: _zones.length,
                     itemBuilder: (context, index) {
-                      final zone = _safeZones[index];
+                      final zone = _zones[index];
                       final name = zone['name'] as String;
                       final h3Index = zone['h3_index_res9'] as String;
                       final id = zone['id'] as String;
@@ -280,9 +384,12 @@ class _SafeZonesScreenState extends State<SafeZonesScreen> {
                           vertical: 8,
                         ),
                         child: ListTile(
-                          leading: const CircleAvatar(
-                            backgroundColor: Color(0xFF4DD0E1),
-                            child: Icon(Icons.shield, color: Colors.white),
+                          leading: CircleAvatar(
+                            backgroundColor: accent,
+                            child: Icon(
+                              widget.config.icon,
+                              color: Colors.white,
+                            ),
                           ),
                           title: Text(
                             name,
@@ -292,7 +399,7 @@ class _SafeZonesScreenState extends State<SafeZonesScreen> {
                             ),
                           ),
                           subtitle: Text(
-                            '$fieldCount ${fieldCount == 1 ? "Feld" : "Felder"}',
+                            '$fieldCount ${fieldCount == 1 ? "field" : "fields"}',
                             style: TextStyle(
                               color: Colors.grey[600],
                               fontSize: 12,
@@ -303,7 +410,7 @@ class _SafeZonesScreenState extends State<SafeZonesScreen> {
                               Icons.delete_outline,
                               color: Colors.red,
                             ),
-                            onPressed: () => _deleteSafeZone(id, name),
+                            onPressed: () => _deleteZone(id, name),
                           ),
                         ),
                       );
@@ -313,24 +420,29 @@ class _SafeZonesScreenState extends State<SafeZonesScreen> {
         ],
       ),
       floatingActionButton: FloatingActionButton.extended(
-        onPressed: _addSafeZone,
-        backgroundColor: const Color(0xFF4DD0E1),
+        onPressed: _addZone,
+        backgroundColor: accent,
         foregroundColor: Colors.black87,
         icon: const Icon(Icons.add),
-        label: const Text('Add Safe Zone'),
+        label: Text('Add ${widget.config.typeLabel}'),
       ),
     );
   }
 }
 
-class _AddSafeZoneScreen extends StatefulWidget {
-  const _AddSafeZoneScreen();
+// ─────────────────────────────────────────────────────────────────────────────
+// Map screen: select H3 hexagons and name the zone
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _AddZoneScreen extends StatefulWidget {
+  const _AddZoneScreen({required this.config});
+  final _ZoneConfig config;
 
   @override
-  State<_AddSafeZoneScreen> createState() => _AddSafeZoneScreenState();
+  State<_AddZoneScreen> createState() => _AddZoneScreenState();
 }
 
-class _AddSafeZoneScreenState extends State<_AddSafeZoneScreen> {
+class _AddZoneScreenState extends State<_AddZoneScreen> {
   final _nameController = TextEditingController();
   final MapController _mapController = MapController();
   H3? _h3;
@@ -368,7 +480,6 @@ class _AddSafeZoneScreenState extends State<_AddSafeZoneScreen> {
           .toList();
 
       setState(() {
-        // Toggle: remove if already selected, add if new
         if (_selectedH3Indices.contains(indexStr)) {
           _selectedH3Indices.remove(indexStr);
           _hexagonPolygons.remove(indexStr);
@@ -380,18 +491,17 @@ class _AddSafeZoneScreenState extends State<_AddSafeZoneScreen> {
     } catch (e) {
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(SnackBar(content: Text('Fehler bei H3-Berechnung: $e')));
+      ).showSnackBar(SnackBar(content: Text('H3 error: $e')));
     }
   }
 
   void _save() {
     if (_nameController.text.trim().isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Bitte einen Namen eingeben')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Please enter a name')));
       return;
     }
-
     if (_selectedH3Indices.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Please select at least one field')),
@@ -407,15 +517,17 @@ class _AddSafeZoneScreenState extends State<_AddSafeZoneScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final accent = widget.config.accent;
+
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
-        title: const Text('Select Safe Zone'),
+        title: Text('Select ${widget.config.typeLabel}'),
         backgroundColor: Colors.black,
       ),
       body: Column(
         children: [
-          // Name Input
+          // Name input
           Padding(
             padding: const EdgeInsets.all(16),
             child: TextField(
@@ -434,7 +546,7 @@ class _AddSafeZoneScreenState extends State<_AddSafeZoneScreen> {
             ),
           ),
 
-          // Info
+          // Info hint
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16),
             child: Container(
@@ -470,14 +582,11 @@ class _AddSafeZoneScreenState extends State<_AddSafeZoneScreen> {
               child: FlutterMap(
                 mapController: _mapController,
                 options: MapOptions(
-                  initialCenter: const latlong.LatLng(
-                    52.5200,
-                    13.4050,
-                  ), // Berlin
+                  initialCenter: const latlong.LatLng(52.5200, 13.4050),
                   initialZoom: 15,
                   minZoom: 10,
                   maxZoom: 18,
-                  onTap: (tapPosition, point) => _onMapTap(point),
+                  onTap: (_, point) => _onMapTap(point),
                 ),
                 children: [
                   TileLayer(
@@ -486,14 +595,13 @@ class _AddSafeZoneScreenState extends State<_AddSafeZoneScreen> {
                     subdomains: const ['a', 'b', 'c'],
                     userAgentPackageName: 'com.example.hang',
                   ),
-                  // Selected H3 Hexagons
                   if (_hexagonPolygons.isNotEmpty)
                     PolygonLayer(
                       polygons: _hexagonPolygons.entries.map((entry) {
                         return Polygon(
                           points: entry.value,
-                          color: const Color(0xFF4DD0E1).withValues(alpha: 0.4),
-                          borderColor: const Color(0xFF4DD0E1),
+                          color: accent.withValues(alpha: 0.4),
+                          borderColor: accent,
                           borderStrokeWidth: 3,
                         );
                       }).toList(),
@@ -503,28 +611,28 @@ class _AddSafeZoneScreenState extends State<_AddSafeZoneScreen> {
             ),
           ),
 
-          // Selected H3 Info
+          // Selection count
           if (_selectedH3Indices.isNotEmpty)
             Container(
               width: double.infinity,
               padding: const EdgeInsets.all(16),
-              color: const Color(0xFF4DD0E1).withValues(alpha: 0.1),
+              color: accent.withValues(alpha: 0.1),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
                     '${_selectedH3Indices.length} ${_selectedH3Indices.length == 1 ? "field" : "fields"} selected',
-                    style: const TextStyle(
-                      color: Color(0xFF4DD0E1),
+                    style: TextStyle(
+                      color: accent,
                       fontWeight: FontWeight.bold,
                       fontSize: 16,
                     ),
                   ),
-                  const SizedBox(height: 8),
+                  const SizedBox(height: 4),
                   Text(
                     'Tap a field again to remove it',
-                    style: const TextStyle(
-                      color: Color(0xFF80DEEA),
+                    style: TextStyle(
+                      color: accent.withValues(alpha: 0.7),
                       fontSize: 12,
                     ),
                   ),
@@ -532,7 +640,7 @@ class _AddSafeZoneScreenState extends State<_AddSafeZoneScreen> {
               ),
             ),
 
-          // Save Button
+          // Save button
           Padding(
             padding: const EdgeInsets.all(16),
             child: SizedBox(
@@ -540,13 +648,16 @@ class _AddSafeZoneScreenState extends State<_AddSafeZoneScreen> {
               child: ElevatedButton(
                 onPressed: _save,
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF4DD0E1),
+                  backgroundColor: accent,
                   foregroundColor: Colors.black87,
                   padding: const EdgeInsets.symmetric(vertical: 16),
                 ),
-                child: const Text(
-                  'Save Safe Zone',
-                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                child: Text(
+                  'Save ${widget.config.typeLabel}',
+                  style: const TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                  ),
                 ),
               ),
             ),

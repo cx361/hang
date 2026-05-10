@@ -111,8 +111,15 @@ class _OnboardingScreenState extends State<OnboardingScreen>
     final accent = _slides[_currentPage].accent;
     final isFinal = _slides[_currentPage].isFinal;
 
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final inactiveDot = isDark
+        ? Colors.white24
+        : Colors.black.withValues(alpha: 0.15);
+    final skipColor = isDark
+        ? Colors.white38
+        : Colors.black.withValues(alpha: 0.35);
+
     return Scaffold(
-      backgroundColor: Colors.black,
       body: SafeArea(
         child: Stack(
           children: [
@@ -134,9 +141,9 @@ class _OnboardingScreenState extends State<OnboardingScreen>
                 right: 20,
                 child: TextButton(
                   onPressed: _finish,
-                  child: const Text(
+                  child: Text(
                     'Skip',
-                    style: TextStyle(color: Colors.white38, fontSize: 14),
+                    style: TextStyle(color: skipColor, fontSize: 14),
                   ),
                 ),
               ),
@@ -160,7 +167,7 @@ class _OnboardingScreenState extends State<OnboardingScreen>
                         width: isActive ? 24 : 6,
                         height: 6,
                         decoration: BoxDecoration(
-                          color: isActive ? accent : Colors.white24,
+                          color: isActive ? accent : inactiveDot,
                           borderRadius: BorderRadius.circular(3),
                         ),
                       );
@@ -253,8 +260,8 @@ class _SlidePage extends StatelessWidget {
           // Title
           Text(
             slide.title,
-            style: const TextStyle(
-              color: Colors.white,
+            style: TextStyle(
+              color: Theme.of(context).colorScheme.onSurface,
               fontSize: 32,
               fontWeight: FontWeight.w800,
               height: 1.15,
@@ -267,7 +274,9 @@ class _SlidePage extends StatelessWidget {
           Text(
             slide.body,
             style: TextStyle(
-              color: Colors.white.withValues(alpha: 0.6),
+              color: Theme.of(
+                context,
+              ).colorScheme.onSurface.withValues(alpha: 0.6),
               fontSize: 16,
               height: 1.65,
               fontWeight: FontWeight.w400,

@@ -17,6 +17,7 @@ import 'glow_wave_overlay.dart';
 import 'auth_wrapper.dart';
 import 'friends_screen.dart';
 import 'onboarding_screen.dart';
+import 'profile_screen.dart';
 import 'proximity_service.dart';
 import 'settings_screen.dart';
 
@@ -325,7 +326,7 @@ class _HangAppState extends State<HangApp> {
           Positioned(
             left: 32,
             right: 32,
-            bottom: 12,
+            bottom: 24,
             child: _FloatingNavBar(
               currentIndex: _currentIndex,
               onTap: (index) {
@@ -473,6 +474,7 @@ class _RadarTabState extends State<_RadarTab> {
   bool _isIncognito = false;
   DateTime? _incognitoUntil;
   bool _isInSafeZone = false;
+  bool _isInSilentZone = false;
   int _visibilityRadius = 2; // kRing (1 = ~500m, 2 = ~1.5km, 3 = ~3km)
   bool _radiusLoaded = false;
 
@@ -520,6 +522,7 @@ class _RadarTabState extends State<_RadarTab> {
     }
     _loadIncognitoStatus();
     _loadSafeZoneStatus();
+    _loadSilentZoneStatus();
     _loadVisibilityRadius();
     _loadLastKnownCell();
 
@@ -691,6 +694,45 @@ class _RadarTabState extends State<_RadarTab> {
     }
   }
 
+  Future<void> _loadSilentZoneStatus() async {
+    final userId = Supabase.instance.client.auth.currentUser?.id;
+    if (userId == null) return;
+
+    try {
+      final hexIndex = currentH3Index?.toRadixString(16);
+
+      final zones = await Supabase.instance.client
+          .from('silent_zones')
+          .select('h3_index_res9')
+          .eq('user_id', userId);
+
+      bool isInSilentZone = false;
+      if (hexIndex != null) {
+        for (final zone in zones) {
+          final hexes = (zone['h3_index_res9'] as String).split(',');
+          if (hexes.contains(hexIndex)) {
+            isInSilentZone = true;
+            break;
+          }
+        }
+      } else {
+        final resp = await Supabase.instance.client
+            .from('profiles')
+            .select('is_in_silent_zone')
+            .eq('id', userId)
+            .single();
+        isInSilentZone = resp['is_in_silent_zone'] ?? false;
+      }
+
+      if (mounted) {
+        setState(() => _isInSilentZone = isInSilentZone);
+      }
+      ProximityService.instance.updateSilentZoneStatus(isInSilentZone);
+    } catch (e) {
+      debugPrint('[radar] Error loading silent zone status: $e');
+    }
+  }
+
   String _getAgeLabel(String? updatedAtStr) {
     if (updatedAtStr == null) return '?';
 
@@ -742,7 +784,8 @@ class _RadarTabState extends State<_RadarTab> {
       bg.Config(
         reset: true,
         desiredAccuracy: bg.Config.DESIRED_ACCURACY_HIGH,
-        distanceFilter: 100.0,
+        distanceFilter: 250.0,
+        useSignificantChangesOnly: true,
         stopOnTerminate: false,
         startOnBoot: true,
         debug: false,
@@ -777,7 +820,7 @@ class _RadarTabState extends State<_RadarTab> {
     }
   }
 
-  void _onLocation(bg.Location location) {
+  Future<void> _onLocation(bg.Location location) async {
     final lat = location.coords.latitude;
     final lng = location.coords.longitude;
     final acc = location.coords.accuracy;
@@ -796,7 +839,7 @@ class _RadarTabState extends State<_RadarTab> {
       return;
     }
 
-    const double kMinAccuracyMeters = 100.0;
+    const double kMinAccuracyMeters = 250.0;
     if (acc > kMinAccuracyMeters) {
       _dbg('Skipping low-accuracy fix: ±${acc.toStringAsFixed(0)}m');
       if (mounted) {
@@ -836,8 +879,10 @@ class _RadarTabState extends State<_RadarTab> {
       });
     }
 
-    // Update user's location in Supabase
-    _updateUserLocation(cell);
+    // Update user's location in Supabase (must complete before scanning
+    // so is_in_silent_zone is current in both the DB and local state before
+    // checkAndPing decides whether to suppress notifications).
+    await _updateUserLocation(cell);
 
     _checkFriendsInKRing(kRingCells);
   }
@@ -854,12 +899,20 @@ class _RadarTabState extends State<_RadarTab> {
     try {
       final hexIndex = cell.toRadixString(16);
 
-      // Check if user is in a safe zone
-      // Safe zones can contain multiple H3 indices (comma-separated)
-      final safeZones = await Supabase.instance.client
-          .from('safe_zones')
-          .select('h3_index_res9')
-          .eq('user_id', user.id);
+      // Check safe zones and silent zones in parallel.
+      final results = await Future.wait([
+        Supabase.instance.client
+            .from('safe_zones')
+            .select('h3_index_res9')
+            .eq('user_id', user.id),
+        Supabase.instance.client
+            .from('silent_zones')
+            .select('h3_index_res9')
+            .eq('user_id', user.id),
+      ]);
+
+      final safeZones = results[0] as List;
+      final silentZones = results[1] as List;
 
       bool isInSafeZone = false;
       for (final zone in safeZones) {
@@ -870,8 +923,18 @@ class _RadarTabState extends State<_RadarTab> {
         }
       }
 
+      bool isInSilentZone = false;
+      for (final zone in silentZones) {
+        final h3Indices = (zone['h3_index_res9'] as String).split(',');
+        if (h3Indices.contains(hexIndex)) {
+          isInSilentZone = true;
+          break;
+        }
+      }
+
       debugPrint(
-        '[location] Updating location: $hexIndex, in safe zone: $isInSafeZone',
+        '[location] Updating location: $hexIndex, '
+        'safe=$isInSafeZone silent=$isInSilentZone',
       );
 
       await Supabase.instance.client
@@ -879,9 +942,15 @@ class _RadarTabState extends State<_RadarTab> {
           .update({
             'last_h3_index_res9': hexIndex,
             'is_in_safe_zone': isInSafeZone,
+            'is_in_silent_zone': isInSilentZone,
             'updated_at': DateTime.now().toUtc().toIso8601String(),
           })
           .eq('id', user.id);
+
+      if (mounted) {
+        setState(() => _isInSilentZone = isInSilentZone);
+      }
+      ProximityService.instance.updateSilentZoneStatus(isInSilentZone);
     } catch (e) {
       debugPrint('[location] Failed to update user location: $e');
     }
@@ -914,6 +983,7 @@ class _RadarTabState extends State<_RadarTab> {
     // Reload incognito and safe zone status before checking friends
     await _loadIncognitoStatus();
     await _loadSafeZoneStatus();
+    await _loadSilentZoneStatus();
 
     // Disable friend detection when incognito
     if (_isIncognito) {
@@ -987,10 +1057,11 @@ class _RadarTabState extends State<_RadarTab> {
 
       // Query profiles that are friends AND NOT in safe zone.
       // Also fetch visibility_radius so we can apply min-kRing (privacy wins).
+      // is_in_silent_zone is fetched so ping suppression can check it per-friend.
       final resp = await Supabase.instance.client
           .from('profiles')
           .select(
-            'handle,last_h3_index_res9,id,updated_at,is_in_safe_zone,is_incognito,incognito_until,visibility_radius',
+            'handle,last_h3_index_res9,id,updated_at,is_in_safe_zone,is_in_silent_zone,is_incognito,incognito_until,visibility_radius,avatar_url',
           )
           .inFilter('id', friendIds.toList())
           .eq('is_in_safe_zone', false)
@@ -1047,8 +1118,24 @@ class _RadarTabState extends State<_RadarTab> {
         final handle = map['handle'] as String?;
         final updatedAt = map['updated_at'] as String?;
         final id = map['id'] as String?;
+        final isInSilentZone = map['is_in_silent_zone'] as bool? ?? false;
+        final rawAvatarUrl = map['avatar_url'] as String?;
+        String? avatarUrl;
+        if (rawAvatarUrl != null) {
+          avatarUrl = rawAvatarUrl.startsWith('http')
+              ? rawAvatarUrl
+              : Supabase.instance.client.storage
+                    .from('avatars')
+                    .getPublicUrl(rawAvatarUrl);
+        }
         if (handle != null) {
-          friends.add({'id': id, 'handle': handle, 'updated_at': updatedAt});
+          friends.add({
+            'id': id,
+            'handle': handle,
+            'updated_at': updatedAt,
+            'is_in_silent_zone': isInSilentZone,
+            'avatar_url': avatarUrl,
+          });
         }
       }
 
@@ -1066,10 +1153,12 @@ class _RadarTabState extends State<_RadarTab> {
 
       _updateWidget();
 
-      // Trigger proximity notifications with 5 h cooldown.
-      if (friends.isNotEmpty) {
-        ProximityService.instance.checkAndPing(friends);
-      }
+      // Always call checkAndPing (even when empty) so the service can clear
+      // its "last nearby" set when friends leave — preventing departure pings.
+      ProximityService.instance.checkAndPing(
+        friends,
+        currentUserInSilentZone: _isInSilentZone,
+      );
     } on TimeoutException catch (e, st) {
       debugPrint('[supabase] Query timeout: $e\n$st');
       if (!mounted) return;
@@ -1123,7 +1212,7 @@ class _RadarTabState extends State<_RadarTab> {
     }
   }
 
-  void _setTestLocation() {
+  Future<void> _setTestLocation() async {
     const testLat = 52.5200;
     const testLng = 13.4050;
 
@@ -1147,8 +1236,9 @@ class _RadarTabState extends State<_RadarTab> {
         });
       }
 
-      // Update user's location in Supabase
-      _updateUserLocation(cell);
+      // Update user's location in Supabase (await so silent zone status is
+      // current before checkAndPing runs).
+      await _updateUserLocation(cell);
 
       _checkFriendsInKRing(kRingCells);
     } catch (e) {
@@ -1240,7 +1330,12 @@ class _RadarTabState extends State<_RadarTab> {
         displacement: 60,
         child: SingleChildScrollView(
           physics: const AlwaysScrollableScrollPhysics(),
-          padding: const EdgeInsets.all(20),
+          padding: EdgeInsets.fromLTRB(
+            20,
+            20,
+            20,
+            20 + MediaQuery.of(context).padding.bottom,
+          ),
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
@@ -1283,6 +1378,57 @@ class _RadarTabState extends State<_RadarTab> {
                               'Radar disabled - You are protected',
                               style: TextStyle(
                                 color: Color(0xFF4DD0E1).withValues(alpha: 0.7),
+                                fontSize: 13,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+
+              // Silent Zone Banner
+              if (_isInSilentZone && !_isInSafeZone && !_isIncognito)
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(16),
+                  margin: const EdgeInsets.only(bottom: 24),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0D1E35),
+                    border: Border.all(
+                      color: const Color(0xFF5B9BD5),
+                      width: 2,
+                    ),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(
+                        Icons.notifications_off,
+                        color: Color(0xFF5B9BD5),
+                        size: 32,
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              'Silent Zone active',
+                              style: TextStyle(
+                                color: Color(0xFF5B9BD5),
+                                fontWeight: FontWeight.bold,
+                                fontSize: 16,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              'Still visible - Pings muted',
+                              style: TextStyle(
+                                color: const Color(
+                                  0xFF5B9BD5,
+                                ).withValues(alpha: 0.7),
                                 fontSize: 13,
                               ),
                             ),
@@ -1359,6 +1505,7 @@ class _RadarTabState extends State<_RadarTab> {
                                   hasNearbyFriends: hasNearbyFriends,
                                   isIncognito: _isIncognito,
                                   isInSafeZone: _isInSafeZone,
+                                  isInSilentZone: _isInSilentZone,
                                   visibilityRadius: _visibilityRadius,
                                   isDark:
                                       Theme.of(context).brightness ==
@@ -1372,7 +1519,9 @@ class _RadarTabState extends State<_RadarTab> {
                         SizedBox.expand(
                           child: GlowWaveOverlay(
                             isActive: hasNearbyFriends,
-                            color: const Color(0xFFFF8800),
+                            color: _isInSilentZone
+                                ? const Color(0xFF5B9BD5)
+                                : const Color(0xFFFF8800),
                           ),
                         ),
                     ],
@@ -1384,7 +1533,11 @@ class _RadarTabState extends State<_RadarTab> {
                 statusText,
                 style: TextStyle(
                   color: hasNearbyFriends
-                      ? const Color(0xFFFF8A00)
+                      ? (_isInSilentZone
+                            ? (Theme.of(context).brightness == Brightness.dark
+                                  ? const Color(0xFF5B9BD5)
+                                  : const Color(0xFF1565C0))
+                            : const Color(0xFFFF8A00))
                       : Theme.of(
                           context,
                         ).colorScheme.onSurface.withValues(alpha: 0.7),
@@ -1463,42 +1616,82 @@ class _RadarTabState extends State<_RadarTab> {
                   final handle = friend['handle'] as String;
                   final updatedAt = friend['updated_at'] as String?;
                   final ageLabel = _getAgeLabel(updatedAt);
+                  final friendId = friend['id'] as String?;
+                  final avatarUrl = friend['avatar_url'] as String?;
+                  final accentColor = _isInSilentZone
+                      ? (Theme.of(context).brightness == Brightness.dark
+                            ? const Color(0xFF5B9BD5)
+                            : const Color(0xFF1565C0))
+                      : const Color(0xFFFF8A00);
                   return Padding(
                     padding: const EdgeInsets.symmetric(vertical: 6),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          '@$handle',
-                          style: const TextStyle(
-                            color: Color(0xFFFF8A00),
-                            fontSize: 16,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                        const SizedBox(width: 6),
-                        Text(
-                          '•',
-                          style: TextStyle(
-                            color: Theme.of(
+                    child: GestureDetector(
+                      onTap: friendId == null
+                          ? null
+                          : () => Navigator.push(
                               context,
-                            ).colorScheme.onSurface.withValues(alpha: 0.2),
-                            fontSize: 14,
+                              MaterialPageRoute(
+                                builder: (_) => ProfileScreen(
+                                  userId: friendId,
+                                  handle: handle,
+                                ),
+                              ),
+                            ),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          CircleAvatar(
+                            radius: 16,
+                            backgroundColor: accentColor.withValues(alpha: 0.2),
+                            backgroundImage: avatarUrl != null
+                                ? NetworkImage(avatarUrl)
+                                : null,
+                            child: avatarUrl == null
+                                ? Text(
+                                    handle.isNotEmpty
+                                        ? handle[0].toUpperCase()
+                                        : '?',
+                                    style: TextStyle(
+                                      color: accentColor,
+                                      fontSize: 13,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  )
+                                : null,
                           ),
-                        ),
-                        const SizedBox(width: 6),
-                        Text(
-                          ageLabel,
-                          style: TextStyle(
-                            color: Theme.of(
-                              context,
-                            ).colorScheme.onSurface.withValues(alpha: 0.35),
-                            fontSize: 13,
-                            fontWeight: FontWeight.w400,
+                          const SizedBox(width: 10),
+                          Text(
+                            '@$handle',
+                            style: TextStyle(
+                              color: accentColor,
+                              fontSize: 16,
+                              fontWeight: FontWeight.w600,
+                            ),
                           ),
-                        ),
-                      ],
+                          const SizedBox(width: 6),
+                          Text(
+                            '•',
+                            style: TextStyle(
+                              color: Theme.of(
+                                context,
+                              ).colorScheme.onSurface.withValues(alpha: 0.2),
+                              fontSize: 14,
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            ageLabel,
+                            style: TextStyle(
+                              color: Theme.of(
+                                context,
+                              ).colorScheme.onSurface.withValues(alpha: 0.35),
+                              fontSize: 13,
+                              fontWeight: FontWeight.w400,
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
                   );
                 }),
@@ -1514,6 +1707,7 @@ class HexagonGridPainter extends CustomPainter {
   final bool hasNearbyFriends;
   final bool isIncognito;
   final bool isInSafeZone;
+  final bool isInSilentZone;
   final int visibilityRadius;
   final bool isDark;
 
@@ -1521,6 +1715,7 @@ class HexagonGridPainter extends CustomPainter {
     required this.hasNearbyFriends,
     this.isIncognito = false,
     this.isInSafeZone = false,
+    this.isInSilentZone = false,
     this.visibilityRadius = 2,
     this.isDark = true,
   });
@@ -1549,6 +1744,11 @@ class HexagonGridPainter extends CustomPainter {
           } else if (isInSafeZone) {
             fillColor = const Color(0xFF1A3A3D);
             borderColor = const Color(0xFF4DD0E1);
+          } else if (isInSilentZone) {
+            fillColor = hasNearbyFriends
+                ? const Color(0xFF0D1E35)
+                : const Color(0xFF081525);
+            borderColor = const Color(0xFF5B9BD5);
           } else {
             fillColor = hasNearbyFriends
                 ? const Color(0xFFFF8A00)
@@ -1600,6 +1800,7 @@ class HexagonGridPainter extends CustomPainter {
     return oldDelegate.hasNearbyFriends != hasNearbyFriends ||
         oldDelegate.isIncognito != isIncognito ||
         oldDelegate.isInSafeZone != isInSafeZone ||
+        oldDelegate.isInSilentZone != isInSilentZone ||
         oldDelegate.visibilityRadius != visibilityRadius ||
         oldDelegate.isDark != isDark;
   }
