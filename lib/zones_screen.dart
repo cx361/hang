@@ -95,8 +95,8 @@ class _SafeZonesScreenState extends State<SafeZonesScreen>
           labelColor: Colors.white,
           unselectedLabelColor: Colors.grey,
           tabs: const [
-            Tab(text: 'Safe Zones'),
-            Tab(text: 'Silent Zones'),
+            Tab(text: 'safe zones'),
+            Tab(text: 'silent zones'),
           ],
         ),
       ),

@@ -100,7 +100,7 @@ Deno.serve(async (req: Request) => {
     try {
       const { status, body } = await sendApnsPush(profile.apns_token, {
         title: "hang.",
-        body: `hey! @${senderHandle}'s close! 🫧`,
+        body: `hey! @${senderHandle}'s close! ✨`,
       });
       results.push(`${recipientId}: APNs ${status} ${body}`);
     } catch (err) {

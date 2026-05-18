@@ -1,15 +1,13 @@
 import 'dart:async';
 import 'dart:io' show Platform;
-import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_apns_only/flutter_apns_only.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 // In debug builds use a short cooldown so testing is easy.
-const _kCooldown = kDebugMode ? Duration(minutes: 1) : Duration(hours: 6);
+const _kCooldown = kDebugMode ? Duration(minutes: 1) : Duration(hours: 5);
 
 // How long a friend must be *absent* from polls before we consider them
 // "departed".  A single missed poll (GPS jitter, brief background) won't
@@ -461,16 +459,12 @@ class ProximityService {
   Future<void> _showNotification(String handle) async {
     // Ensure the plugin is ready even if initialize() wasn't awaited.
     if (!_initialized) await initialize();
-    // Ripple pattern: strong → gap → medium → gap → soft.
-    final vibrationPattern = Int64List.fromList([0, 120, 80, 60, 80, 30]);
     final android = AndroidNotificationDetails(
       _channelId,
       _channelName,
       channelDescription: _channelDescription,
       importance: Importance.high,
       priority: Priority.high,
-      enableVibration: true,
-      vibrationPattern: vibrationPattern,
     );
     const apple = DarwinNotificationDetails(
       presentAlert: true,
@@ -490,17 +484,12 @@ class ProximityService {
     await _notifications.show(
       id,
       'hang.',
-      'hey! @$handle\'s close! 🫧',
+      'hey! @$handle\'s close! ✨',
       details,
     );
     _log('[proximity] Notification shown for $handle');
 
-    // Foreground haptic: ripple (strong → medium → light, fading like a ripple).
-    HapticFeedback.heavyImpact();
-    await Future.delayed(const Duration(milliseconds: 200));
-    HapticFeedback.mediumImpact();
-    await Future.delayed(const Duration(milliseconds: 140));
-    HapticFeedback.lightImpact();
+    // Custom vibration/haptic removed: iOS does not support custom vibration for notifications.
   }
 
   // ── Ping logic ────────────────────────────────────────────────────────────

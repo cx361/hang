@@ -784,8 +784,10 @@ class _RadarTabState extends State<_RadarTab> {
       bg.Config(
         reset: true,
         desiredAccuracy: bg.Config.DESIRED_ACCURACY_HIGH,
-        distanceFilter: 250.0,
-        useSignificantChangesOnly: true,
+        distanceFilter: 175.0,
+        //useSignificantChangesOnly: true,
+        stopTimeout: 3, // Wait 3 minutes of inactivity before shutting down GPS
+        stationaryRadius: 25.0, // Don't wake up GPS until least 25m movement
         stopOnTerminate: false,
         startOnBoot: true,
         debug: false,

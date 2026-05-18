@@ -31,7 +31,9 @@
 	<key>NSCameraUsageDescription</key>
 	<string>hang needs camera access to take a profile picture.</string>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
-	<string>hang needs your location at all times to notify you when friends are nearby, even when the app is closed.</string>
+	<string>hang needs background location to notify you when friends are nearby, even when the app is closed. 
+	To protect your privacy, we only use abstract 400m sectors and never store your exact coordinates or location history. 
+	The app is battery-efficient and only updates when you move a significant distance.</string>
 	<key>NSLocationAlwaysUsageDescription</key>
 	<string>hang needs your location in the background to notify you when friends are nearby, even when the app is closed.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
