@@ -1013,36 +1013,42 @@ class _RadarTabState extends State<_RadarTab> {
     }
 
     bg.BackgroundGeolocation.ready(
-      bg.Config(
-        reset: true,
-        desiredAccuracy: bg.Config.DESIRED_ACCURACY_HIGH,
-        distanceFilter: 100.0,
-        //useSignificantChangesOnly: true,
-        stopTimeout: 3, // Wait 3 minutes of inactivity before shutting down GPS
-        stationaryRadius: 25.0, // Don't wake up GPS until least 25m movement
-        stopOnTerminate: false,
-        startOnBoot: true,
-        debug: false,
-        logLevel: bg.Config.LOG_LEVEL_OFF,
-        locationAuthorizationRequest: 'Always',
-        showsBackgroundLocationIndicator: false,
-        heartbeatInterval: 3600,
-      ),
-    ).then((bg.State state) {
-      debugPrint('[location] Background geolocation ready');
-      if (mounted) {
-        setState(() {
-          statusText = 'Location activated';
+          bg.Config(
+            reset: true,
+            desiredAccuracy: bg.Config.DESIRED_ACCURACY_HIGH,
+            distanceFilter: 100.0,
+            //useSignificantChangesOnly: true,
+            stopTimeout:
+                3, // Wait 3 minutes of inactivity before shutting down GPS
+            stationaryRadius:
+                25.0, // Don't wake up GPS until least 25m movement
+            stopOnTerminate: false,
+            startOnBoot: true,
+            debug: false,
+            logLevel: bg.Config.LOG_LEVEL_OFF,
+            locationAuthorizationRequest: 'Always',
+            showsBackgroundLocationIndicator: false,
+            heartbeatInterval: 3600,
+          ),
+        )
+        .then((bg.State state) {
+          debugPrint('[location] Background geolocation ready');
+          if (mounted) {
+            setState(() {
+              statusText = 'Location activated';
+            });
+          }
+        })
+        .catchError((e) {
+          debugPrint(
+            '[location] ❌ Background geolocation initialization failed: $e',
+          );
+          if (mounted) {
+            setState(() {
+              statusText = 'Location service unavailable: $e';
+            });
+          }
         });
-      }
-    }).catchError((e) {
-      debugPrint('[location] ❌ Background geolocation initialization failed: $e');
-      if (mounted) {
-        setState(() {
-          statusText = 'Location service unavailable: $e';
-        });
-      }
-    });
 
     bg.BackgroundGeolocation.onLocation(_onLocation, _onLocationError);
     bg.BackgroundGeolocation.onHeartbeat((bg.HeartbeatEvent event) {

@@ -1,4 +1,5 @@
 import 'package:flutter/foundation.dart';
+import 'package:crypto/crypto.dart';
 
 /// Centralized validation helper to prevent duplicated logic and ensure consistency.
 class ValidationHelpers {
@@ -101,6 +102,66 @@ class ValidationHelpers {
   static void debugLog(String tag, String message) {
     if (kDebugMode) {
       debugPrint('[$tag] $message');
+    }
+  }
+
+  /// Hashes a phone number for privacy-preserving contact matching.
+  /// 
+  /// Normalization process:
+  /// 1. Removes all whitespace, hyphens, parentheses, and other formatting
+  /// 2. Converts leading "0" to "+49" for German numbers (default country code)
+  /// 3. Ensures the number starts with "+" for international format
+  /// 4. Hashes the normalized E.164-like format using SHA-256
+  /// 5. Returns lowercase hex string of the hash
+  /// 
+  /// Returns null if the phone number is invalid or empty.
+  /// 
+  /// Parameters:
+  /// - rawPhone: Raw phone number string (any format: 0171..., +49171..., (017)1..., etc.)
+  /// - defaultCountryCode: Country code prefix for numbers without leading + (default: '+49' for Germany)
+  /// 
+  /// Security Note: Phone number is never stored in plaintext. Only the hash is transmitted to Supabase.
+  /// 
+  /// Examples:
+  /// - "0171 123 4567" → SHA256("+49171123456") → "abc123..."
+  /// - "+49171123456" → SHA256("+49171123456") → "abc123..."
+  /// - "+33123456789" → SHA256("+33123456789") → "def456..."
+  static String? hashPhoneE164(String rawPhone, {String defaultCountryCode = '+49'}) {
+    if (rawPhone.trim().isEmpty) {
+      return null;
+    }
+
+    try {
+      // Remove all whitespace, hyphens, parentheses, and other formatting
+      var normalized = rawPhone.trim().replaceAll(RegExp(r'[\s\-().]'), '');
+
+      if (normalized.isEmpty) {
+        return null;
+      }
+
+      // Handle leading zero (German number format) → convert to +49
+      if (normalized.startsWith('0') && !normalized.startsWith('00')) {
+        normalized = '+49${normalized.substring(1)}';
+      }
+
+      // If no country code prefix, add default
+      if (!normalized.startsWith('+')) {
+        // Assume it's missing the country code; add default
+        normalized = defaultCountryCode + normalized;
+      }
+
+      // Validate: should start with + and contain only digits after that
+      if (!normalized.startsWith('+') || !RegExp(r'^\+\d{7,15}$').hasMatch(normalized)) {
+        debugLog('hashPhoneE164', 'Invalid phone format: $normalized');
+        return null;
+      }
+
+      // Hash using SHA-256 and return lowercase hex
+      final hash = sha256.convert(normalized.codeUnits);
+      return hash.toString().toLowerCase();
+    } catch (e) {
+      debugLog('hashPhoneE164', 'Failed to hash phone number: $e');
+      return null;
     }
   }
 }

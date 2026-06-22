@@ -1,5 +1,8 @@
 import 'dart:async';
+import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'profile_screen.dart';
@@ -14,23 +17,35 @@ class FriendsScreen extends StatefulWidget {
 
 class _FriendsScreenState extends State<FriendsScreen>
     with SingleTickerProviderStateMixin {
+  static const MethodChannel _contactsChannel = MethodChannel('hang/contacts');
+
   late final TabController _tabController;
   final _searchController = TextEditingController();
+  final _myPhoneController = TextEditingController();
 
   List<Map<String, dynamic>> _searchResults = [];
   List<Map<String, dynamic>> _pendingRequests = [];
   List<Map<String, dynamic>> _friendsList = [];
   List<Map<String, dynamic>> _sentRequests = [];
-  
+
   // HIGH FIX #16: Pagination for friends list
   int _friendsPage = 0;
   bool _isLoadingMoreFriends = false;
   bool _hasMoreFriends = true;
   static const int _friendsPageSize = 50;
-  
+
   // HIGH FIX #9: Friend request rate limiting
   DateTime? _lastFriendRequestTime;
   static const _friendRequestCooldown = Duration(seconds: 10);
+
+  bool _isSyncingContacts = false;
+  bool _contactsSyncEnabled = false;
+  bool _isPhoneLinked = false;
+  String? _contactsError;
+  String? _myPhoneError;
+  List<Map<String, dynamic>> _matchedContacts = [];
+  final Map<String, Map<String, String>> _contactByHash = {};
+  int _lastTabIndex = 0;
 
   final _shareButtonKey = GlobalKey();
   Timer? _searchDebounce;
@@ -42,11 +57,72 @@ class _FriendsScreenState extends State<FriendsScreen>
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 3, vsync: this);
+    _tabController = TabController(length: 4, vsync: this);
+    _tabController.addListener(_onTabChanged);
     _currentUserId = Supabase.instance.client.auth.currentUser?.id;
     _loadIncognitoStatus();
+    _loadPhoneLinkStatus();
     _loadFriendships();
     _subscribeToFriendships();
+    _loadContactsSyncPreference();
+  }
+
+  Future<void> _loadPhoneLinkStatus() async {
+    if (_currentUserId == null) return;
+    try {
+      final resp = await Supabase.instance.client
+          .from('profiles')
+          .select('phone_hash')
+          .eq('id', _currentUserId!)
+          .maybeSingle();
+
+      final phoneHash = resp?['phone_hash'] as String?;
+      if (!mounted) return;
+      setState(() {
+        _isPhoneLinked = phoneHash != null && phoneHash.isNotEmpty;
+      });
+    } catch (e) {
+      debugPrint('[friends] load phone link status failed: $e');
+    }
+  }
+
+  Future<void> _loadContactsSyncPreference() async {
+    final prefs = await SharedPreferences.getInstance();
+    final enabled = prefs.getBool('contacts_sync_enabled') ?? false;
+    if (!mounted) return;
+    setState(() {
+      _contactsSyncEnabled = enabled;
+    });
+  }
+
+  Future<void> _setContactsSyncEnabled(bool enabled) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('contacts_sync_enabled', enabled);
+    if (!mounted) return;
+
+    setState(() {
+      _contactsSyncEnabled = enabled;
+      if (!enabled) {
+        _matchedContacts = [];
+        _contactsError = null;
+      }
+    });
+
+    if (enabled && _tabController.index == 3 && !_isSyncingContacts) {
+      unawaited(_syncPhonebook());
+    }
+  }
+
+  void _onTabChanged() {
+    if (_tabController.indexIsChanging) return;
+    if (_tabController.index == _lastTabIndex) return;
+
+    _lastTabIndex = _tabController.index;
+    if (_tabController.index == 3 &&
+        _contactsSyncEnabled &&
+        !_isSyncingContacts) {
+      unawaited(_syncPhonebook());
+    }
   }
 
   void _subscribeToFriendships() {
@@ -77,8 +153,10 @@ class _FriendsScreenState extends State<FriendsScreen>
   @override
   void dispose() {
     _friendshipsChannel?.unsubscribe();
+    _tabController.removeListener(_onTabChanged);
     _tabController.dispose();
     _searchController.dispose();
+    _myPhoneController.dispose();
     _searchDebounce?.cancel();
     super.dispose();
   }
@@ -122,7 +200,8 @@ class _FriendsScreenState extends State<FriendsScreen>
   }
 
   Future<void> _loadMoreFriends() async {
-    if (_currentUserId == null || _isLoadingMoreFriends || !_hasMoreFriends) return;
+    if (_currentUserId == null || _isLoadingMoreFriends || !_hasMoreFriends)
+      return;
 
     _isLoadingMoreFriends = true;
 
@@ -143,7 +222,10 @@ class _FriendsScreenState extends State<FriendsScreen>
           .or('requester_id.eq.$_currentUserId,addressee_id.eq.$_currentUserId')
           .order('created_at', ascending: false)
           // HIGH FIX #16: Implement pagination to avoid loading all friends at once
-          .range(_friendsPage * _friendsPageSize, (_friendsPage + 1) * _friendsPageSize - 1);
+          .range(
+            _friendsPage * _friendsPageSize,
+            (_friendsPage + 1) * _friendsPageSize - 1,
+          );
 
       // Parse results into appropriate lists
       final List<Map<String, dynamic>> pendingResp = [];
@@ -171,7 +253,9 @@ class _FriendsScreenState extends State<FriendsScreen>
       for (final item in acceptedFriends) {
         final requesterId = item['requester_id'] as String?;
         final addresseeId = item['addressee_id'] as String?;
-        final userId = requesterId == _currentUserId ? addresseeId : requesterId;
+        final userId = requesterId == _currentUserId
+            ? addresseeId
+            : requesterId;
 
         if (requesterId == _currentUserId) {
           final addressee = item['addressee'] as Map?;
@@ -206,7 +290,7 @@ class _FriendsScreenState extends State<FriendsScreen>
           } else {
             _friendsList.addAll(allFriends);
           }
-          
+
           // Check if there are more results
           _hasMoreFriends = resp.length >= _friendsPageSize;
           _friendsPage++;
@@ -264,13 +348,16 @@ class _FriendsScreenState extends State<FriendsScreen>
       // HIGH FIX #13: Use Set for deduplication
       final resultIds = <String>{};
       final results = <Map<String, dynamic>>[];
-      
+
       for (final item in resp) {
         final map = Map<String, dynamic>.from(item as Map);
         final userId = map['id'] as String?;
 
         // Skip current user, duplicates, and null IDs
-        if (userId == null || userId == _currentUserId || resultIds.contains(userId)) continue;
+        if (userId == null ||
+            userId == _currentUserId ||
+            resultIds.contains(userId))
+          continue;
         resultIds.add(userId);
 
         // Mark status for UI
@@ -317,6 +404,185 @@ class _FriendsScreenState extends State<FriendsScreen>
     }
   }
 
+  Future<void> _saveMyPhoneHash() async {
+    if (_currentUserId == null) return;
+
+    final raw = _myPhoneController.text.trim();
+    if (raw.isEmpty) {
+      setState(() {
+        _myPhoneError = 'Please enter your phone number first.';
+      });
+      return;
+    }
+
+    final hash = ValidationHelpers.hashPhoneE164(raw);
+    if (hash == null) {
+      setState(() {
+        _myPhoneError = 'Invalid phone number format.';
+      });
+      return;
+    }
+
+    try {
+      await Supabase.instance.client
+          .from('profiles')
+          .update({'phone_hash': hash})
+          .eq('id', _currentUserId!);
+
+      if (mounted) {
+        setState(() {
+          _myPhoneError = null;
+          _isPhoneLinked = true;
+          _myPhoneController.clear();
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Your phone number is now linked.')),
+        );
+        await _loadPhoneLinkStatus();
+      }
+    } catch (e) {
+      debugPrint('[friends] save phone hash failed: $e');
+      if (mounted) {
+        final msg = e.toString().contains('phone_hash')
+            ? 'Das hat gerade nicht geklappt. Bitte versuche es in ein paar Minuten erneut.'
+            : 'Deine Nummer konnte nicht gespeichert werden. Bitte versuche es erneut.';
+        setState(() {
+          _myPhoneError = msg;
+        });
+      }
+    }
+  }
+
+  void _startPhoneRelink() {
+    setState(() {
+      _isPhoneLinked = false;
+      _myPhoneError = null;
+      _myPhoneController.clear();
+    });
+  }
+
+  Future<void> _syncPhonebook() async {
+    if (_currentUserId == null) return;
+    if (!Platform.isIOS) {
+      setState(() {
+        _contactsError = 'Phonebook sync is currently available on iOS only.';
+      });
+      return;
+    }
+
+    setState(() {
+      _isSyncingContacts = true;
+      _contactsError = null;
+    });
+
+    try {
+      final dynamic raw = await _contactsChannel.invokeMethod('getContacts');
+      final contacts = (raw as List<dynamic>? ?? <dynamic>[])
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList();
+
+      final hashes = <String>{};
+      final seenLocalHashes = <String>{};
+      _contactByHash.clear();
+
+      for (final contact in contacts) {
+        final name = (contact['name'] as String?)?.trim();
+        final phones =
+            (contact['phones'] as List?)?.whereType<String>() ??
+            const <String>[];
+
+        for (final phone in phones) {
+          final hash = ValidationHelpers.hashPhoneE164(phone);
+          if (hash == null) continue;
+          hashes.add(hash);
+
+          final cleanedName = (name == null || name.isEmpty) ? 'Unknown' : name;
+          _contactByHash.putIfAbsent(
+            hash,
+            () => {'name': cleanedName, 'phone': phone},
+          );
+
+          // Avoid duplicate UI rows when the same number appears multiple times
+          // (different formatting, linked contacts, or repeated phone labels).
+          if (seenLocalHashes.add(hash)) {
+            // first occurrence per normalized number is enough
+          }
+        }
+      }
+
+      if (hashes.isEmpty) {
+        if (mounted) {
+          setState(() {
+            _matchedContacts = [];
+            _contactsError = 'No valid numbers found in your contacts.';
+            _isSyncingContacts = false;
+          });
+        }
+        return;
+      }
+
+      final matched = <Map<String, dynamic>>[];
+      final hashList = hashes.toList(growable: false);
+      const chunkSize = 100;
+
+      for (var i = 0; i < hashList.length; i += chunkSize) {
+        final end = (i + chunkSize > hashList.length)
+            ? hashList.length
+            : i + chunkSize;
+        final chunk = hashList.sublist(i, end);
+
+        final resp = await Supabase.instance.client
+            .from('profiles')
+            .select('id, handle, avatar_url, phone_hash')
+            .inFilter('phone_hash', chunk)
+            .neq('id', _currentUserId!);
+
+        for (final item in resp) {
+          final map = Map<String, dynamic>.from(item as Map);
+          final userId = map['id'] as String?;
+          if (userId == null) continue;
+
+          String status = 'none';
+          if (_friendsList.any((f) => f['user_id'] == userId)) {
+            status = 'friend';
+          } else if (_sentRequests.any((r) => r['addressee_id'] == userId)) {
+            status = 'sent';
+          } else if (_pendingRequests.any((r) => r['requester_id'] == userId)) {
+            status = 'received';
+          }
+          map['friendship_status'] = status;
+          matched.add(map);
+        }
+      }
+
+      if (mounted) {
+        setState(() {
+          _matchedContacts = matched;
+          _isSyncingContacts = false;
+        });
+      }
+    } on PlatformException catch (e) {
+      if (mounted) {
+        setState(() {
+          _contactsError = e.message ?? 'Could not read contacts.';
+          _isSyncingContacts = false;
+        });
+      }
+    } catch (e) {
+      debugPrint('[friends] contact sync failed: $e');
+      if (mounted) {
+        final msg = e.toString().contains('phone_hash')
+            ? 'Kontakte konnten gerade nicht synchronisiert werden. Bitte versuche es in ein paar Minuten erneut.'
+            : 'Kontakte konnten nicht synchronisiert werden. Bitte versuche es erneut.';
+        setState(() {
+          _contactsError = msg;
+          _isSyncingContacts = false;
+        });
+      }
+    }
+  }
+
   Future<void> _sendFriendRequest(String addresseeId) async {
     if (_currentUserId == null) return;
 
@@ -335,13 +601,18 @@ class _FriendsScreenState extends State<FriendsScreen>
 
     // HIGH FIX #9: Rate limiting on friend requests
     if (_lastFriendRequestTime != null) {
-      final timeSinceLastRequest = DateTime.now().difference(_lastFriendRequestTime!);
+      final timeSinceLastRequest = DateTime.now().difference(
+        _lastFriendRequestTime!,
+      );
       if (timeSinceLastRequest < _friendRequestCooldown) {
-        final remainingSeconds = _friendRequestCooldown.inSeconds - timeSinceLastRequest.inSeconds;
+        final remainingSeconds =
+            _friendRequestCooldown.inSeconds - timeSinceLastRequest.inSeconds;
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-              content: Text('Please wait ${remainingSeconds}s before sending another request'),
+              content: Text(
+                'Please wait ${remainingSeconds}s before sending another request',
+              ),
             ),
           );
         }
@@ -536,6 +807,8 @@ class _FriendsScreenState extends State<FriendsScreen>
           Material(
             child: TabBar(
               controller: _tabController,
+              isScrollable: true,
+              tabAlignment: TabAlignment.start,
               tabs: [
                 Tab(text: 'Search', icon: const Icon(Icons.search)),
                 Tab(
@@ -546,6 +819,7 @@ class _FriendsScreenState extends State<FriendsScreen>
                   text: 'Friends (${_friendsList.length})',
                   icon: const Icon(Icons.people),
                 ),
+                const Tab(text: 'Contacts', icon: Icon(Icons.contacts)),
               ],
             ),
           ),
@@ -556,6 +830,7 @@ class _FriendsScreenState extends State<FriendsScreen>
                 _buildSearchTab(),
                 _buildRequestsTab(),
                 _buildFriendsTab(),
+                _buildContactsTab(),
               ],
             ),
           ),
@@ -929,6 +1204,190 @@ class _FriendsScreenState extends State<FriendsScreen>
           ),
         );
       },
+    );
+  }
+
+  Widget _buildContactsTab() {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 140),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (!_isPhoneLinked)
+            const Text(
+              'Find friends from your iPhone contacts',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+          if (!_isPhoneLinked) const SizedBox(height: 8),
+          if (!_isPhoneLinked)
+            Text(
+              'First link your own number, then sync your phonebook.',
+              style: const TextStyle(color: Colors.grey),
+            ),
+          const SizedBox(height: 16),
+          if (_isPhoneLinked)
+            Row(
+              children: [
+                Expanded(
+                  flex: 70,
+                  child: Row(
+                    children: [
+                      const Icon(Icons.verified, color: Colors.green, size: 18),
+                      const SizedBox(width: 8),
+                      const Text(
+                        'Linked',
+                        style: TextStyle(
+                          fontWeight: FontWeight.w600,
+                          fontSize: 13,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      TextButton(
+                        onPressed: _startPhoneRelink,
+                        style: TextButton.styleFrom(
+                          padding: EdgeInsets.zero,
+                          minimumSize: const Size(40, 30),
+                        ),
+                        child: const Text(
+                          'Change my number',
+                          style: TextStyle(fontSize: 12),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  flex: 30,
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const Text(
+                        'sync',
+                        style: TextStyle(
+                          fontWeight: FontWeight.w600,
+                          fontSize: 13,
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      if (_isSyncingContacts)
+                        const SizedBox(
+                          width: 12,
+                          height: 12,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      else
+                        Switch(
+                          value: _contactsSyncEnabled,
+                          onChanged: (value) => _setContactsSyncEnabled(value),
+                        ),
+                    ],
+                  ),
+                ),
+              ],
+            )
+          else
+            Column(
+              children: [
+                TextField(
+                  controller: _myPhoneController,
+                  keyboardType: TextInputType.phone,
+                  decoration: InputDecoration(
+                    labelText: 'Your phone number',
+                    hintText: '+49 171 1234567',
+                    errorText: _myPhoneError,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                  onChanged: (_) {
+                    if (_myPhoneError != null) {
+                      setState(() {
+                        _myPhoneError = null;
+                      });
+                    }
+                  },
+                ),
+                const SizedBox(height: 10),
+                ElevatedButton.icon(
+                  onPressed: _saveMyPhoneHash,
+                  icon: const Icon(Icons.verified_user),
+                  label: const Text('Link My Number'),
+                ),
+              ],
+            ),
+          const SizedBox(height: 16),
+          if (_contactsError != null) ...[
+            const SizedBox(height: 10),
+            Text(_contactsError!, style: const TextStyle(color: Colors.red)),
+          ],
+          const SizedBox(height: 20),
+          if (_matchedContacts.isNotEmpty) ...[
+            const Text(
+              'Already on hang',
+              style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            ..._matchedContacts.map((profile) {
+              final handle = profile['handle'] as String? ?? 'Unknown';
+              final userId = profile['id'] as String?;
+              final status = profile['friendship_status'] as String? ?? 'none';
+              final phoneHash = profile['phone_hash'] as String?;
+              final localName = phoneHash == null
+                  ? 'Contact'
+                  : (_contactByHash[phoneHash]?['name'] ?? 'Contact');
+
+              return ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: _avatarCircle(
+                  profile['avatar_url'] as String?,
+                  handle,
+                ),
+                title: Text('@$handle'),
+                subtitle: Text(localName),
+                trailing: status == 'friend'
+                    ? const Chip(label: Text('Friend'))
+                    : status == 'sent'
+                    ? const Chip(label: Text('Pending'))
+                    : ElevatedButton(
+                        onPressed: userId == null
+                            ? null
+                            : () => _sendFriendRequest(userId),
+                        child: const Text('Add'),
+                      ),
+                onTap: userId == null
+                    ? null
+                    : () => Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) =>
+                              ProfileScreen(userId: userId, handle: handle),
+                        ),
+                      ),
+              );
+            }),
+          ],
+          const SizedBox(height: 20),
+          Center(
+            child: ElevatedButton.icon(
+              key: _shareButtonKey,
+              onPressed: () {
+                final box =
+                    _shareButtonKey.currentContext?.findRenderObject()
+                        as RenderBox?;
+                Share.share(
+                  'Hey! Join me on hang. the app that lets you know when friends are nearby. Download it here: https://hangsocial.app',
+                  sharePositionOrigin: box != null
+                      ? box.localToGlobal(Offset.zero) & box.size
+                      : null,
+                );
+              },
+              icon: const Icon(Icons.share),
+              label: const Text('Invite a friend'),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

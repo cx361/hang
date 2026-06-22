@@ -30,6 +30,8 @@
 	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>hang needs camera access to take a profile picture.</string>
+	<key>NSContactsUsageDescription</key>
+	<string>hang needs access to your contacts to help you find friends who are already using the app.</string>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
 	<string>hang needs background location to notify you when friends are nearby, even when the app is closed. 
 	To protect your privacy, we only use abstract 400m sectors and never store your exact coordinates or location history. 
