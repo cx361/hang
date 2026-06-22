@@ -2,19 +2,13 @@ import 'dart:async';
 import 'dart:io' show Platform;
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
 import 'package:flutter_apns_only/flutter_apns_only.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 // In debug builds use a short cooldown so testing is easy.
-const _kCooldown = kDebugMode ? Duration(minutes: 1) : Duration(hours: 5);
-
-// How long a friend must be *absent* from polls before we consider them
-// "departed".  A single missed poll (GPS jitter, brief background) won't
-// clear them from _lastNearbyIds, preventing a spurious re-arrival ping.
-const _kDepartureGrace = kDebugMode
-    ? Duration(seconds: 30)
-    : Duration(minutes: 5);
+const _kCooldown = kDebugMode ? Duration(minutes: 1) : Duration(hours: 3);
 
 // Maximum age of a friend's last-known location before we refuse to ping.
 // If a friend's phone died / went offline, their stale H3 hex can linger in
@@ -23,16 +17,21 @@ const _kLocationMaxAge = kDebugMode
     ? Duration(minutes: 120)
     : Duration(hours: 4);
 
-/// Handles symmetric proximity notifications between two users.
+/// Handles symmetric proximity notifications between two users via DB-authoritative cooldowns.
 ///
 /// When User A detects User B nearby:
 ///   1. We check the `proximity_pings` table for a cooldown on the pair.
-///   2. If no cooldown: upsert the ping (including triggered_by_user_id) and
-///      notify User A immediately via a local notification.
+///      Cooldown is active if either `pinged_at` or `last_seen_at` is within
+///      the cooldown window. A fresh `last_seen_at` keeps sessions alive
+///      across app restarts without re-pinging.
+///   2. If no cooldown: upsert the ping (including triggered_by_user_id),
+///      set both `pinged_at` and `last_seen_at` to now, and notify User A
+///      immediately via a local notification.
 ///   3. A Supabase Edge Function (push-proximity-ping) triggered by the DB
 ///      INSERT sends an APNs push to User B's device — this works even when
 ///      User B's app is completely terminated.
-///   4. If the cooldown is still active: silently skip.
+///   4. If the cooldown is still active: heartbeat `last_seen_at` and skip
+///      the ping.
 ///
 /// Because the pair_key is canonical (min UID : max UID), even if both clients
 /// run the check simultaneously the database serialises them — only one INSERT
@@ -71,13 +70,6 @@ class ProximityService {
   // pair_keys that this client just upserted — used to suppress the echo
   // notification that arrives via Realtime for the local user.
   final _selfTriggered = <String>{};
-
-  // Maps friend ID → last time they appeared in a proximity poll.
-  // A friend is only considered "departed" (removed from the nearby set) once
-  // they have been absent for longer than _kDepartureGrace.  This prevents
-  // GPS jitter or a brief app-background from resetting the arrival guard and
-  // causing a spurious re-ping while two people are still hanging out.
-  final _lastSeenAt = <String, DateTime>{};
 
   // Cached silent-zone status for the current user.  Updated by
   // checkAndPing() and updateSilentZoneStatus() so that _onEvent() can
@@ -159,6 +151,9 @@ class ProximityService {
     _subscribeRealtime();
     _registerApnsToken();
 
+    // CRITICAL: Register lifecycle observer to clean up channels when app terminates
+    WidgetsBinding.instance.addObserver(_LifecycleObserver(this));
+
     // Log the actual iOS permission state so we can diagnose silent failures.
     final iosPlugin = _notifications
         .resolvePlatformSpecificImplementation<
@@ -213,14 +208,40 @@ class ProximityService {
   Future<void> _saveApnsToken(String token) async {
     final userId = Supabase.instance.client.auth.currentUser?.id;
     if (userId == null) return;
-    try {
-      await Supabase.instance.client
-          .from('profiles')
-          .update({'apns_token': token})
-          .eq('id', userId);
-      _log('[proximity] APNs token saved to profiles');
-    } catch (e) {
-      _log('[proximity] Error saving APNs token: $e');
+
+    // CRITICAL FIX #7 & HIGH FIX #17: Token validation, rotation, and retry logic
+    if (token.isEmpty || token.length < 32) {
+      _log('[proximity] Invalid APNs token format — skipping save');
+      return;
+    }
+
+    int retryCount = 0;
+    const maxRetries = 3;
+
+    while (retryCount < maxRetries) {
+      try {
+        await Supabase.instance.client
+            .from('profiles')
+            .update({
+              'apns_token': token,
+              'apns_token_updated_at': DateTime.now().toUtc().toIso8601String(),
+            })
+            .eq('id', userId);
+        _log('[proximity] APNs token saved and rotated');
+        return;
+      } catch (e) {
+        retryCount++;
+        if (retryCount >= maxRetries) {
+          _log(
+            '[proximity] Failed to save APNs token after $maxRetries attempts: $e',
+          );
+          return;
+        }
+        // Exponential backoff: 500ms, 1s, 2s
+        await Future<void>.delayed(
+          Duration(milliseconds: 500 * (1 << (retryCount - 1))),
+        );
+      }
     }
   }
 
@@ -495,13 +516,12 @@ class ProximityService {
   // ── Ping logic ────────────────────────────────────────────────────────────
 
   /// Call this after each proximity poll — pass the full current nearby list
-  /// (may be empty). Only friends who were NOT nearby on a recent previous
-  /// call (i.e. genuinely just arrived) trigger a ping. Friends who have been
-  /// continuously in range are skipped, even across brief GPS gaps, thanks to
-  /// the [_kDepartureGrace] window in [_lastSeenAt].
+  /// (may be empty). Ping decisions are DB-authoritative:
+  /// `_tryPing` checks `pinged_at` + `last_seen_at` for cooldown and updates
+  /// `last_seen_at` for active sessions.
   ///
   /// [currentUserInSilentZone]: pass the caller's current silent-zone flag.
-  /// When true, all pings are suppressed in both directions for this tick.
+  /// When true, all ping attempts are suppressed for this tick.
   Future<void> checkAndPing(
     List<Map<String, dynamic>> nearbyFriends, {
     bool currentUserInSilentZone = false,
@@ -513,47 +533,7 @@ class ProximityService {
     if (currentUserId == null) return;
 
     final now = DateTime.now();
-    final currentIds = nearbyFriends
-        .map((f) => f['id'] as String?)
-        .whereType<String>()
-        .toSet();
 
-    // Snapshot who was "nearby" BEFORE updating timestamps for this tick.
-    // A friend is considered continuously nearby if they appear in this
-    // snapshot (they were seen recently enough to still be in the map).
-    final previouslyNearby = _lastSeenAt.keys.toSet();
-
-    // Update last-seen timestamps for everyone currently visible.
-    for (final id in currentIds) {
-      _lastSeenAt[id] = now;
-    }
-
-    // Evict friends who have been absent longer than the departure grace
-    // period.  This prevents GPS jitter / a brief app-background from
-    // treating them as "departed" and causing a spurious re-arrival ping.
-    _lastSeenAt.removeWhere(
-      (id, lastSeen) => now.difference(lastSeen) > _kDepartureGrace,
-    );
-
-    // Heartbeat: update last_seen_at in the DB for friends who are already
-    // tracked as nearby.  This keeps the session alive across app restarts
-    // without triggering a new ping.  We do this even in a silent zone so
-    // the cooldown persists correctly after the zone is exited.
-    for (final friend in nearbyFriends) {
-      final friendId = friend['id'] as String?;
-      if (friendId == null) continue;
-      if (!previouslyNearby.contains(friendId)) continue;
-      final hbA = currentUserId.compareTo(friendId) <= 0
-          ? currentUserId
-          : friendId;
-      final hbB = currentUserId.compareTo(friendId) <= 0
-          ? friendId
-          : currentUserId;
-      _updateLastSeen('$hbA:$hbB');
-    }
-
-    // If the current user is in a silent zone, skip all pings this tick but
-    // still maintain _lastSeenAt so future arrivals are detected correctly.
     if (currentUserInSilentZone) {
       _log('[proximity] Skipping all pings — current user in silent zone');
       return;
@@ -563,13 +543,7 @@ class ProximityService {
       final friendId = friend['id'] as String?;
       if (friendId == null) continue;
 
-      // Skip friends who are already part of an ongoing session — the
-      // heartbeat above keeps last_seen_at fresh so the cooldown holds.
-      if (previouslyNearby.contains(friendId)) continue;
-
       // Skip friends whose location is stale (phone died, app killed, etc.).
-      // We still let _lastSeenAt track them so a genuine re-arrival after
-      // they come back online is detected correctly.
       final updatedAtStr = friend['updated_at'] as String?;
       if (updatedAtStr != null) {
         try {
@@ -604,21 +578,62 @@ class ProximityService {
       }
 
       final handle = (friend['handle'] as String?) ?? 'Jemand';
+      // CRITICAL: Double-check incognito status right before ping
+      // to prevent incognito status from being bypassed by timing attacks
       await _tryPing(currentUserId, friendId, handle);
     }
   }
 
+  /// Attempts to ping a friend pair if cooldown allows.
+  /// Implements DB-authoritative cooldown logic:
+  /// - Checks existing `proximity_pings` record for `pinged_at` or `last_seen_at` within cooldown.
+  /// - If active: heartbeat `last_seen_at` and return (no new ping).
+  /// - If expired: upsert with new `pinged_at` and `last_seen_at`, then notify.
+  /// Verifies incognito status fresh from DB right before ping to prevent timing attacks.
   Future<void> _tryPing(
     String currentUserId,
     String friendId,
     String handle,
   ) async {
-    // Canonical pair_key — smaller UUID first so both clients produce the same key.
-    final a = currentUserId.compareTo(friendId) <= 0 ? currentUserId : friendId;
-    final b = currentUserId.compareTo(friendId) <= 0 ? friendId : currentUserId;
-    final pairKey = '$a:$b';
-
     try {
+      final userProfile = await Supabase.instance.client
+          .from('profiles')
+          .select('is_incognito, incognito_until')
+          .eq('id', currentUserId)
+          .maybeSingle();
+
+      if (userProfile != null) {
+        final isIncognito = userProfile['is_incognito'] as bool? ?? false;
+        if (isIncognito) {
+          final untilStr = userProfile['incognito_until'];
+          if (untilStr != null) {
+            final now = DateTime.now().toUtc();
+            // Ensure explicit UTC parsing
+            String normalized = untilStr;
+            if (!untilStr.endsWith('Z') && !untilStr.contains('+')) {
+              normalized = '${untilStr}Z';
+            }
+            final until = DateTime.parse(normalized).toUtc();
+            if (now.isBefore(until)) {
+              _log(
+                '[proximity] ⚠️ Skipping ping for $handle — '
+                'user incognito mode active (just became active)',
+              );
+              return;
+            }
+          }
+        }
+      }
+
+      // Canonical pair_key — smaller UUID first so both clients produce the same key.
+      final a = currentUserId.compareTo(friendId) <= 0
+          ? currentUserId
+          : friendId;
+      final b = currentUserId.compareTo(friendId) <= 0
+          ? friendId
+          : currentUserId;
+      final pairKey = '$a:$b';
+
       // Check whether the cooldown is still active for this pair.
       // We fetch both pinged_at and last_seen_at without a server-side filter
       // so we can OR them in Dart: cooldown is active if EITHER timestamp is
@@ -652,6 +667,8 @@ class ProximityService {
         }
 
         if (withinCooldown) {
+          // Heartbeat active sessions without issuing a new ping.
+          _updateLastSeen(pairKey);
           _log(
             '[proximity] Cooldown for $pairKey '
             '(pinged_at: ${existing['pinged_at']}, '
@@ -683,14 +700,14 @@ class ProximityService {
       // The friend is notified via APNs (Supabase Edge Function).
       await _showNotification(handle);
     } catch (e) {
-      _selfTriggered.remove(pairKey);
-      _log('[proximity] Error pinging $pairKey: $e');
+      _log('[proximity] Error in _tryPing for $handle: $e');
     }
   }
 
-  // Updates last_seen_at for an ongoing hang session without changing
-  // pinged_at.  The DB webhook guard in the Edge Function detects that
-  // pinged_at is unchanged and skips the APNs push.
+  /// Heartbeat: updates `last_seen_at` for an ongoing session without changing `pinged_at`.
+  /// Used both during active proximity (checkAndPing) and when cooldown is active (_tryPing).
+  /// The DB webhook guard in the Edge Function detects that `pinged_at` is unchanged
+  /// and skips the APNs push, so only local session bookkeeping happens.
   void _updateLastSeen(String pairKey) {
     Supabase.instance.client
         .from('proximity_pings')
@@ -718,5 +735,20 @@ class ProximityService {
     _apnsConnector?.dispose();
     _apnsConnector = null;
     _initialized = false;
+  }
+}
+
+// CRITICAL: Lifecycle observer to ensure Realtime channels are cleaned up
+// when the app terminates, preventing connection pool exhaustion on app restart.
+class _LifecycleObserver extends WidgetsBindingObserver {
+  _LifecycleObserver(this.service);
+  final ProximityService service;
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.detached) {
+      debugPrint('[proximity] App detached - cleaning up Realtime channels');
+      service.dispose();
+    }
   }
 }

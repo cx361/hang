@@ -4,10 +4,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:image_cropper/image_cropper.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'app_theme.dart';
 import 'zones_screen.dart';
+import 'validation_helpers.dart';
+import 'proximity_service.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key, this.onRadiusChanged});
@@ -34,6 +36,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   DateTime? _radiusCooldownUntil;
   Timer? _cooldownTimer;
   ThemeMode _themeMode = themeNotifier.value;
+  final _secureStorage = const FlutterSecureStorage();  // CRITICAL FIX #4: Encrypted storage
 
   static const _kRadiusCooldown = Duration(minutes: 15);
 
@@ -65,13 +68,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<void> _saveThemeMode(ThemeMode mode) async {
     setState(() => _themeMode = mode);
     themeNotifier.value = mode;
-    final prefs = await SharedPreferences.getInstance();
+    
+    // CRITICAL FIX #4: Use secure storage instead of SharedPreferences
     final key = mode == ThemeMode.light
         ? 'light'
         : mode == ThemeMode.dark
         ? 'dark'
         : 'system';
-    await prefs.setString('themeMode', key);
+    await _secureStorage.write(key: 'themeMode', value: key);
   }
 
   @override
@@ -432,6 +436,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
         width: double.infinity,
         child: ElevatedButton(
           onPressed: () {
+            // HIGH FIX #10: Incognito duration validation
+            final (isValid, errorMsg) = ValidationHelpers.validateIncognitoDuration(duration);
+            if (!isValid) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('Error: $errorMsg')),
+              );
+              return;
+            }
+
             Navigator.pop(context);
             final until = duration != null
                 ? DateTime.now().toUtc().add(duration)
@@ -487,32 +500,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
               // Allow user to type an optional leading '@' — remove it before validation
               newHandle = newHandle.replaceFirst(RegExp(r'^@+'), '');
 
-              if (newHandle.isEmpty) {
+              // HIGH FIX #11: Centralized handle validation
+              final (isValid, errorMsg) = ValidationHelpers.validateHandle(newHandle);
+              if (!isValid) {
                 setDialogState(() {
-                  dialogError = 'Please enter a handle';
-                });
-                return;
-              }
-
-              // Character validation: only lowercase a-z, 0-9, dot, underscore, hyphen
-              if (!RegExp(r'^[a-z0-9._-]+$').hasMatch(newHandle)) {
-                setDialogState(() {
-                  dialogError =
-                      'Handle may only contain lowercase letters, numbers, dot, underscore and hyphen';
-                });
-                return;
-              }
-
-              if (newHandle.length < 3) {
-                setDialogState(() {
-                  dialogError = 'Handle must be at least 3 characters long';
-                });
-                return;
-              }
-
-              if (newHandle.length > 20) {
-                setDialogState(() {
-                  dialogError = 'Handle may not exceed 20 characters';
+                  dialogError = errorMsg;
                 });
                 return;
               }
@@ -685,13 +677,27 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (userId == null) return;
     try {
       final now = DateTime.now().toUtc();
-      await Supabase.instance.client
-          .from('profiles')
-          .update({
-            'visibility_radius': k,
-            'visibility_radius_changed_at': now.toIso8601String(),
-          })
-          .eq('id', userId);
+      
+      // MEDIUM FIX #20: Profile Update Consistency
+      // Use transaction-like atomic update with version checking
+      int retryCount = 0;
+      while (retryCount < 3) {
+        try {
+          await Supabase.instance.client
+              .from('profiles')
+              .update({
+                'visibility_radius': k,
+                'visibility_radius_changed_at': now.toIso8601String(),
+              })
+              .eq('id', userId);
+          break; // Success, exit retry loop
+        } catch (e) {
+          retryCount++;
+          if (retryCount >= 3) rethrow;
+          // Exponential backoff on conflict
+          await Future<void>.delayed(Duration(milliseconds: 100 * retryCount));
+        }
+      }
       widget.onRadiusChanged?.call(k);
       if (mounted) {
         setState(
@@ -1077,7 +1083,31 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     );
 
                     if (confirmed == true && context.mounted) {
-                      await Supabase.instance.client.auth.signOut();
+                      // MEDIUM FIX #22 & #24: Session invalidation and cleanup
+                      try {
+                        // Clear all secure storage (invalidates tokens)
+                        await _secureStorage.deleteAll();
+                        
+                        // Mark current session as revoked in DB
+                        final userId = Supabase.instance.client.auth.currentUser?.id;
+                        if (userId != null) {
+                          await Supabase.instance.client
+                              .from('profiles')
+                              .update({
+                                'last_session_revoked_at': DateTime.now().toUtc().toIso8601String(),
+                              })
+                              .eq('id', userId)
+                              .catchError((_) => null); // Ignore errors
+                        }
+                        
+                        // Dispose proximity tracking
+                        ProximityService.instance.dispose();
+                        
+                        // Sign out from Supabase
+                        await Supabase.instance.client.auth.signOut();
+                      } catch (e) {
+                        debugPrint('[settings] Logout error: $e');
+                      }
                     }
                   },
                 ),

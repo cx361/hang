@@ -3,15 +3,18 @@ import 'dart:io' show Platform, File;
 import 'dart:math' show cos, max, min, pi, sin, sqrt;
 import 'dart:ui' show ImageFilter;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_background_geolocation/flutter_background_geolocation.dart'
     as bg;
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:h3_flutter/h3_flutter.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:home_widget/home_widget.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'app_theme.dart';
 import 'glow_wave_overlay.dart';
 import 'auth_wrapper.dart';
@@ -79,9 +82,9 @@ Future<void> main() async {
     await HomeWidget.setAppGroupId('group.com.hangsocial.hang');
   }
 
-  // Load persisted theme preference.
-  final prefs = await SharedPreferences.getInstance();
-  final savedTheme = prefs.getString('themeMode');
+  // Load persisted theme preference using secure storage
+  const secureStorage = FlutterSecureStorage();
+  final savedTheme = await secureStorage.read(key: 'themeMode');
   if (savedTheme == 'light') {
     themeNotifier.value = ThemeMode.light;
   } else if (savedTheme == 'dark') {
@@ -176,7 +179,176 @@ class _AppEntryState extends State<AppEntry> {
         },
       );
     }
-    return const AuthWrapper();
+    return const PermissionGate(child: AuthWrapper());
+  }
+}
+
+// ─── Permission Gate: blocks access until location permission is "Always" ─────
+class PermissionGate extends StatefulWidget {
+  const PermissionGate({required this.child, super.key});
+  final Widget child;
+
+  @override
+  State<PermissionGate> createState() => _PermissionGateState();
+}
+
+class _PermissionGateState extends State<PermissionGate>
+    with WidgetsBindingObserver {
+  bool _hasAlwaysPermission = false;
+  bool _checking = true;
+  Timer? _permissionCheckTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _checkPermission();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _permissionCheckTimer?.cancel();
+    super.dispose();
+  }
+
+  // Called when the app resumes from settings/background
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      debugPrint('[permission] App resumed from background, rechecking...');
+      _checkPermission();
+    }
+  }
+
+  Future<void> _checkPermission() async {
+    try {
+      final status = await bg.BackgroundGeolocation.requestPermission();
+      // Android: 2 = PERMISSION_GRANTED_ALWAYS
+      // iOS: 3 = PERMISSION_GRANTED_ALWAYS
+      final isAlways = status == 2 || status == 3;
+      debugPrint(
+        '[permission] Status: $status ${isAlways ? '✅ ALWAYS' : '(not always)'}',
+      );
+      if (mounted) {
+        setState(() {
+          _hasAlwaysPermission = isAlways;
+          _checking = false;
+        });
+        if (isAlways) {
+          debugPrint(
+            '[permission] ✅ Always permission detected! Unlocking app...',
+          );
+          _permissionCheckTimer?.cancel();
+          _permissionCheckTimer = null;
+        }
+      }
+    } catch (e) {
+      debugPrint('[permission] Error checking location permission: $e');
+      if (mounted) {
+        setState(() => _checking = false);
+      }
+    }
+  }
+
+  Future<void> _openSettings() async {
+    try {
+      _permissionCheckTimer?.cancel();
+      _permissionCheckTimer = null;
+
+      debugPrint('[permission] Opening app settings...');
+      if (Platform.isIOS) {
+        await launchUrl(
+          Uri.parse('app-settings:'),
+          mode: LaunchMode.externalApplication,
+        );
+      } else if (Platform.isAndroid) {
+        await launchUrl(
+          Uri(scheme: 'package', path: 'com.hangsocial.hang'),
+          mode: LaunchMode.externalApplication,
+        );
+      }
+
+      // Check every 2 seconds for 30 seconds (less frequent, less annoying)
+      int checkCount = 0;
+      _permissionCheckTimer = Timer.periodic(const Duration(seconds: 2), (
+        _,
+      ) async {
+        checkCount++;
+        await _checkPermission();
+
+        // Stop after 15 attempts (~30 seconds)
+        if (checkCount >= 15) {
+          _permissionCheckTimer?.cancel();
+          _permissionCheckTimer = null;
+          debugPrint('[permission] ⏱️ Stopped checking after 30s');
+        }
+      });
+    } catch (e) {
+      debugPrint('[permission] Error opening settings: $e');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_checking) {
+      return const SplashScreen();
+    }
+
+    if (!_hasAlwaysPermission) {
+      return Scaffold(
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const Icon(
+                  Icons.location_off,
+                  size: 64,
+                  color: Color(0xFFFF8C00),
+                ),
+                const SizedBox(height: 24),
+                const Text(
+                  'Location Access Required',
+                  style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  'hang. requires location access "Always" to detect nearby friends in the background.',
+                  style: TextStyle(
+                    fontSize: 16,
+                    color: Theme.of(
+                      context,
+                    ).colorScheme.onSurface.withValues(alpha: 0.6),
+                  ),
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 32),
+                ElevatedButton(
+                  onPressed: _openSettings,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFFFF8C00),
+                    foregroundColor: Colors.black,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 32,
+                      vertical: 14,
+                    ),
+                  ),
+                  child: const Text(
+                    'Open Settings',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    return widget.child;
   }
 }
 
@@ -477,6 +649,7 @@ class _RadarTabState extends State<_RadarTab> {
   DateTime? _incognitoUntil;
   bool _isInSafeZone = false;
   bool _isInSilentZone = false;
+  String _buildVersionLabel = '';
   int _visibilityRadius = 2; // kRing (1 = ~500m, 2 = ~1.5km, 3 = ~3km)
   bool _radiusLoaded = false;
 
@@ -497,6 +670,7 @@ class _RadarTabState extends State<_RadarTab> {
   @override
   void initState() {
     super.initState();
+    _loadBuildVersion();
     try {
       h3 = const H3Factory().load();
       _dbg('H3 init: OK');
@@ -535,6 +709,57 @@ class _RadarTabState extends State<_RadarTab> {
     ProximityService.instance.initialize().catchError((e) {
       debugPrint('[proximity] init error: $e');
     });
+
+    // CRITICAL FIX #6: Check app restart cooldown exploit
+    // Ensure that restarting the app doesn't bypass proximity cooldowns
+    _checkAndEnforceProximityCooldowns();
+  }
+
+  /// CRITICAL FIX #6: Enforce proximity cooldowns from database on app startup
+  /// This prevents users from bypassing cooldowns by restarting the app
+  Future<void> _checkAndEnforceProximityCooldowns() async {
+    try {
+      final userId = Supabase.instance.client.auth.currentUser?.id;
+      if (userId == null) return;
+
+      // Keep startup guard aligned with the runtime cooldown policy.
+      final cooldownDuration = kDebugMode
+          ? const Duration(minutes: 1)
+          : const Duration(hours: 3);
+      final cutoffIso = DateTime.now()
+          .toUtc()
+          .subtract(cooldownDuration)
+          .toIso8601String();
+
+      final recentPings = await Supabase.instance.client
+          .from('proximity_pings')
+          .select('last_seen_at')
+          .or('user_a_id.eq.$userId,user_b_id.eq.$userId')
+          .gte('last_seen_at', cutoffIso)
+          .limit(1);
+
+      if (recentPings.isEmpty) return;
+
+      // Cooldown is still active for at least one connection.
+      // No ping is issued here; this is a pure startup guard.
+      _dbg(
+        'Proximity cooldown active '
+        '(last_seen_at within ${cooldownDuration.inMinutes}min)',
+      );
+    } catch (e) {
+      _dbg('Error checking proximity cooldowns: $e');
+    }
+  }
+
+  Future<void> _loadBuildVersion() async {
+    try {
+      final info = await PackageInfo.fromPlatform();
+      final label = 'Build ${info.buildNumber}';
+      if (!mounted) return;
+      setState(() => _buildVersionLabel = label);
+    } catch (e) {
+      _dbg('Package info unavailable: $e');
+    }
   }
 
   @override
@@ -739,7 +964,12 @@ class _RadarTabState extends State<_RadarTab> {
     if (updatedAtStr == null) return '?';
 
     try {
-      final updatedAt = DateTime.parse(updatedAtStr).toUtc();
+      // Ensure explicit UTC parsing with 'Z' suffix if not present
+      String normalized = updatedAtStr;
+      if (!updatedAtStr.endsWith('Z') && !updatedAtStr.contains('+')) {
+        normalized = '${updatedAtStr}Z';
+      }
+      final updatedAt = DateTime.parse(normalized).toUtc();
       final age = DateTime.now().toUtc().difference(updatedAt);
 
       if (age.inMinutes < 10) {
@@ -786,7 +1016,7 @@ class _RadarTabState extends State<_RadarTab> {
       bg.Config(
         reset: true,
         desiredAccuracy: bg.Config.DESIRED_ACCURACY_HIGH,
-        distanceFilter: 175.0,
+        distanceFilter: 100.0,
         //useSignificantChangesOnly: true,
         stopTimeout: 3, // Wait 3 minutes of inactivity before shutting down GPS
         stationaryRadius: 25.0, // Don't wake up GPS until least 25m movement
@@ -805,9 +1035,23 @@ class _RadarTabState extends State<_RadarTab> {
           statusText = 'Location activated';
         });
       }
+    }).catchError((e) {
+      debugPrint('[location] ❌ Background geolocation initialization failed: $e');
+      if (mounted) {
+        setState(() {
+          statusText = 'Location service unavailable: $e';
+        });
+      }
     });
 
     bg.BackgroundGeolocation.onLocation(_onLocation, _onLocationError);
+    bg.BackgroundGeolocation.onHeartbeat((bg.HeartbeatEvent event) {
+      final ts = DateTime.now().toLocal().toString().substring(11, 19);
+      _dbg(
+        '📍 HEARTBEAT [$ts] triggered proximity check (location stale—checking anyway)',
+      );
+      _refreshSector();
+    });
     bg.BackgroundGeolocation.start();
 
     // Get current position immediately so the stream fires right away.
@@ -828,9 +1072,15 @@ class _RadarTabState extends State<_RadarTab> {
     final lat = location.coords.latitude;
     final lng = location.coords.longitude;
     final acc = location.coords.accuracy;
-    _dbg(
-      'GPS ${lat.toStringAsFixed(5)},${lng.toStringAsFixed(5)} ±${acc.toStringAsFixed(0)}m mock=${location.mock}',
-    );
+    final ts = DateTime.now().toLocal().toString().substring(11, 19);
+    if (kDebugMode) {
+      _dbg(
+        '📍 GPS [$ts] ${lat.toStringAsFixed(5)},${lng.toStringAsFixed(5)} ±${acc.toStringAsFixed(0)}m mock=${location.mock}',
+      );
+    } else {
+      // Production: log without exact coordinates for privacy
+      _dbg('📍 GPS [$ts] accuracy±${acc.toStringAsFixed(0)}m');
+    }
 
     if (h3 == null) {
       _dbg('H3 is null — cannot process location');
@@ -988,7 +1238,14 @@ class _RadarTabState extends State<_RadarTab> {
     if (_isCheckingFriends) return;
     _isCheckingFriends = true;
     try {
-      // Reload incognito and safe zone status before checking friends
+      final hexesRes9 = kRingCells.map((h) => h.toRadixString(16)).toList();
+      if (!supabaseAvailable) return;
+
+      final currentUserId = Supabase.instance.client.auth.currentUser?.id;
+      if (currentUserId == null) return;
+
+      // CRITICAL: Load zone status fresh from DB BEFORE friend check
+      // This ensures safety zones, silent zones, and incognito status are current
       await _loadIncognitoStatus();
       await _loadSafeZoneStatus();
       await _loadSilentZoneStatus();
@@ -1016,12 +1273,6 @@ class _RadarTabState extends State<_RadarTab> {
         }
         return;
       }
-
-      final hexesRes9 = kRingCells.map((h) => h.toRadixString(16)).toList();
-      if (!supabaseAvailable) return;
-
-      final currentUserId = Supabase.instance.client.auth.currentUser?.id;
-      if (currentUserId == null) return;
 
       debugPrint(
         '[supabase] Checking friends in kRing (${hexesRes9.length} cells)',
@@ -1069,12 +1320,17 @@ class _RadarTabState extends State<_RadarTab> {
 
       final now = DateTime.now().toUtc();
       final visibleFriends = resp.where((friend) {
-        // Incognito check
+        // Incognito check with UTC timestamp parsing
         final isIncognito = friend['is_incognito'] ?? false;
         if (isIncognito) {
           final untilStr = friend['incognito_until'];
           if (untilStr == null) return false;
-          final until = DateTime.parse(untilStr);
+          // Ensure explicit UTC parsing with 'Z' suffix if not present
+          String normalized = untilStr;
+          if (!untilStr.endsWith('Z') && !untilStr.contains('+')) {
+            normalized = '${untilStr}Z';
+          }
+          final until = DateTime.parse(normalized).toUtc();
           if (!now.isAfter(until)) return false;
         }
 
@@ -1321,7 +1577,27 @@ class _RadarTabState extends State<_RadarTab> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(elevation: 0, title: const Text('hang.')),
+      appBar: AppBar(
+        elevation: 0,
+        title: const Text('hang.'),
+        actions: [
+          if (_buildVersionLabel.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(right: 16),
+              child: Center(
+                child: Text(
+                  _buildVersionLabel,
+                  style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                    color: Theme.of(
+                      context,
+                    ).colorScheme.onSurface.withValues(alpha: 0.65),
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
       body: RefreshIndicator(
         onRefresh: _refreshSector,
         color: const Color(0xFFFF8C00),

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'validation_helpers.dart';
 
 class AuthScreen extends StatefulWidget {
   const AuthScreen({super.key});
@@ -23,11 +24,32 @@ class _AuthScreenState extends State<AuthScreen> {
   }
 
   Future<void> _handleAuth() async {
+    // MEDIUM FIX #18: Password strength requirements
     if (_emailController.text.isEmpty || _passwordController.text.isEmpty) {
       setState(() {
         _errorMessage = 'Please enter email and password';
       });
       return;
+    }
+
+    // Validate email format
+    final (isEmailValid, emailError) = ValidationHelpers.validateEmail(_emailController.text);
+    if (!isEmailValid) {
+      setState(() {
+        _errorMessage = emailError;
+      });
+      return;
+    }
+
+    // Validate password only on signup
+    if (!_isLogin) {
+      final (isPasswordValid, passwordError) = ValidationHelpers.validatePassword(_passwordController.text);
+      if (!isPasswordValid) {
+        setState(() {
+          _errorMessage = passwordError;
+        });
+        return;
+      }
     }
 
     setState(() {

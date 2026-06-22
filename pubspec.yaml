@@ -48,6 +48,10 @@ dependencies:
   image_cropper: ^9.1.0
   flutter_apns_only: ^1.6.0
   share_plus: ^10.0.0
+  package_info_plus: ^8.1.2
+  device_info_plus: ^11.1.2
+  url_launcher: ^6.3.0
+  flutter_secure_storage: ^10.3.1
 
 
 dev_dependencies:

@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'profile_screen.dart';
+import 'validation_helpers.dart';
 
 class FriendsScreen extends StatefulWidget {
   const FriendsScreen({super.key});
@@ -20,6 +21,16 @@ class _FriendsScreenState extends State<FriendsScreen>
   List<Map<String, dynamic>> _pendingRequests = [];
   List<Map<String, dynamic>> _friendsList = [];
   List<Map<String, dynamic>> _sentRequests = [];
+  
+  // HIGH FIX #16: Pagination for friends list
+  int _friendsPage = 0;
+  bool _isLoadingMoreFriends = false;
+  bool _hasMoreFriends = true;
+  static const int _friendsPageSize = 50;
+  
+  // HIGH FIX #9: Friend request rate limiting
+  DateTime? _lastFriendRequestTime;
+  static const _friendRequestCooldown = Duration(seconds: 10);
 
   final _shareButtonKey = GlobalKey();
   Timer? _searchDebounce;
@@ -104,91 +115,104 @@ class _FriendsScreenState extends State<FriendsScreen>
   Future<void> _loadFriendships() async {
     if (_currentUserId == null) return;
 
+    // Reset pagination when reloading
+    _friendsPage = 0;
+    _hasMoreFriends = true;
+    await _loadMoreFriends();
+  }
+
+  Future<void> _loadMoreFriends() async {
+    if (_currentUserId == null || _isLoadingMoreFriends || !_hasMoreFriends) return;
+
+    _isLoadingMoreFriends = true;
+
     try {
-      // Load pending incoming requests
-      final pendingResp = await Supabase.instance.client
+      // CRITICAL FIX #1: Combined query instead of 4 separate queries (N+1 problem)
+      // Use OR filter to get all friendships in one query
+      final resp = await Supabase.instance.client
           .from('friendships')
           .select('''
             id,
             requester_id,
-            status,
-            created_at,
-            requester:profiles!friendships_requester_id_fkey(handle, avatar_url)
-          ''')
-          .eq('addressee_id', _currentUserId!)
-          .eq('status', 'pending')
-          .order('created_at', ascending: false);
-
-      // Load sent requests
-      final sentResp = await Supabase.instance.client
-          .from('friendships')
-          .select('''
-            id,
             addressee_id,
             status,
             created_at,
+            requester:profiles!friendships_requester_id_fkey(handle, avatar_url),
             addressee:profiles!friendships_addressee_id_fkey(handle, avatar_url)
           ''')
-          .eq('requester_id', _currentUserId!)
-          .eq('status', 'pending')
-          .order('created_at', ascending: false);
+          .or('requester_id.eq.$_currentUserId,addressee_id.eq.$_currentUserId')
+          .order('created_at', ascending: false)
+          // HIGH FIX #16: Implement pagination to avoid loading all friends at once
+          .range(_friendsPage * _friendsPageSize, (_friendsPage + 1) * _friendsPageSize - 1);
 
-      // Load accepted friends
-      final friendsAsRequester = await Supabase.instance.client
-          .from('friendships')
-          .select('''
-            id,
-            addressee_id,
-            addressee:profiles!friendships_addressee_id_fkey(handle, avatar_url)
-          ''')
-          .eq('requester_id', _currentUserId!)
-          .eq('status', 'accepted');
+      // Parse results into appropriate lists
+      final List<Map<String, dynamic>> pendingResp = [];
+      final List<Map<String, dynamic>> sentResp = [];
+      final List<Map<String, dynamic>> acceptedFriends = [];
 
-      final friendsAsAddressee = await Supabase.instance.client
-          .from('friendships')
-          .select('''
-            id,
-            requester_id,
-            requester:profiles!friendships_requester_id_fkey(handle, avatar_url)
-          ''')
-          .eq('addressee_id', _currentUserId!)
-          .eq('status', 'accepted');
-
-      // Combine both directions
-      final allFriends = <Map<String, dynamic>>[];
-      for (final item in friendsAsRequester) {
+      for (final item in resp) {
         final map = Map<String, dynamic>.from(item as Map);
-        final addressee = map['addressee'] as Map?;
-        if (addressee != null && addressee['handle'] != null) {
-          allFriends.add({
-            'id': map['id'],
-            'user_id': map['addressee_id'],
-            'handle': addressee['handle'],
-            'avatar_url': addressee['avatar_url'],
-          });
+        final status = map['status'] as String?;
+        final addresseeId = map['addressee_id'] as String?;
+
+        if (status == 'pending') {
+          if (addresseeId == _currentUserId) {
+            pendingResp.add(map);
+          } else {
+            sentResp.add(map);
+          }
+        } else if (status == 'accepted') {
+          acceptedFriends.add(map);
         }
       }
-      for (final item in friendsAsAddressee) {
-        final map = Map<String, dynamic>.from(item as Map);
-        final requester = map['requester'] as Map?;
-        if (requester != null && requester['handle'] != null) {
-          allFriends.add({
-            'id': map['id'],
-            'user_id': map['requester_id'],
-            'handle': requester['handle'],
-            'avatar_url': requester['avatar_url'],
-          });
+
+      // Combine both directions for accepted friends
+      final allFriends = <Map<String, dynamic>>[];
+      for (final item in acceptedFriends) {
+        final requesterId = item['requester_id'] as String?;
+        final addresseeId = item['addressee_id'] as String?;
+        final userId = requesterId == _currentUserId ? addresseeId : requesterId;
+
+        if (requesterId == _currentUserId) {
+          final addressee = item['addressee'] as Map?;
+          if (addressee != null && addressee['handle'] != null) {
+            allFriends.add({
+              'id': item['id'],
+              'user_id': userId,
+              'handle': addressee['handle'],
+              'avatar_url': addressee['avatar_url'],
+            });
+          }
+        } else {
+          final requester = item['requester'] as Map?;
+          if (requester != null && requester['handle'] != null) {
+            allFriends.add({
+              'id': item['id'],
+              'user_id': userId,
+              'handle': requester['handle'],
+              'avatar_url': requester['avatar_url'],
+            });
+          }
         }
       }
 
       if (mounted) {
         setState(() {
-          _pendingRequests = pendingResp.cast<Map<String, dynamic>>();
-          _sentRequests = sentResp.cast<Map<String, dynamic>>();
-          _friendsList = allFriends;
+          // On first page, replace; otherwise append
+          if (_friendsPage == 0) {
+            _pendingRequests = pendingResp.cast<Map<String, dynamic>>();
+            _sentRequests = sentResp.cast<Map<String, dynamic>>();
+            _friendsList = allFriends;
+          } else {
+            _friendsList.addAll(allFriends);
+          }
+          
+          // Check if there are more results
+          _hasMoreFriends = resp.length >= _friendsPageSize;
+          _friendsPage++;
         });
         // Keep search results in sync with the updated friendship state.
-        if (_searchController.text.trim().isNotEmpty) {
+        if (_searchController.text.trim().isNotEmpty && _friendsPage == 1) {
           _searchUsers(_searchController.text);
         }
       }
@@ -199,6 +223,8 @@ class _FriendsScreenState extends State<FriendsScreen>
           SnackBar(content: Text('Error loading friendships: $e')),
         );
       }
+    } finally {
+      _isLoadingMoreFriends = false;
     }
   }
 
@@ -226,8 +252,8 @@ class _FriendsScreenState extends State<FriendsScreen>
     }
 
     try {
-      // Search by handle (case-insensitive)
-      final searchQuery = query.trim().toLowerCase();
+      // CRITICAL FIX #2: SQL injection protection - sanitize search query
+      final searchQuery = ValidationHelpers.sanitizeSearchQuery(query);
       final resp = await Supabase.instance.client
           .from('profiles')
           .select('id, handle, avatar_url')
@@ -235,13 +261,17 @@ class _FriendsScreenState extends State<FriendsScreen>
           .limit(20);
 
       // Filter out current user and existing friends/requests
+      // HIGH FIX #13: Use Set for deduplication
+      final resultIds = <String>{};
       final results = <Map<String, dynamic>>[];
+      
       for (final item in resp) {
         final map = Map<String, dynamic>.from(item as Map);
         final userId = map['id'] as String?;
 
-        // Skip current user
-        if (userId == _currentUserId) continue;
+        // Skip current user, duplicates, and null IDs
+        if (userId == null || userId == _currentUserId || resultIds.contains(userId)) continue;
+        resultIds.add(userId);
 
         // Mark status for UI
         String status = 'none';
@@ -303,6 +333,22 @@ class _FriendsScreenState extends State<FriendsScreen>
       return;
     }
 
+    // HIGH FIX #9: Rate limiting on friend requests
+    if (_lastFriendRequestTime != null) {
+      final timeSinceLastRequest = DateTime.now().difference(_lastFriendRequestTime!);
+      if (timeSinceLastRequest < _friendRequestCooldown) {
+        final remainingSeconds = _friendRequestCooldown.inSeconds - timeSinceLastRequest.inSeconds;
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Please wait ${remainingSeconds}s before sending another request'),
+            ),
+          );
+        }
+        return;
+      }
+    }
+
     try {
       // Check if friendship already exists (in either direction)
       final existing = await Supabase.instance.client
@@ -332,12 +378,26 @@ class _FriendsScreenState extends State<FriendsScreen>
         return;
       }
 
-      // Create new friendship request
-      await Supabase.instance.client.from('friendships').insert({
-        'requester_id': _currentUserId,
-        'addressee_id': addresseeId,
-        'status': 'pending',
-      });
+      // Create new friendship request with retry logic
+      int retryCount = 0;
+      const maxRetries = 3;
+      while (retryCount < maxRetries) {
+        try {
+          await Supabase.instance.client.from('friendships').insert({
+            'requester_id': _currentUserId,
+            'addressee_id': addresseeId,
+            'status': 'pending',
+          });
+          break;
+        } catch (e) {
+          retryCount++;
+          if (retryCount >= maxRetries) rethrow;
+          await Future<void>.delayed(const Duration(milliseconds: 500));
+        }
+      }
+
+      // Update rate limiter
+      _lastFriendRequestTime = DateTime.now();
 
       if (mounted) {
         ScaffoldMessenger.of(
@@ -504,7 +564,7 @@ class _FriendsScreenState extends State<FriendsScreen>
     );
   }
 
-  static String? _resolveAvatarUrl(String? stored) {
+  String? _resolveAvatarUrl(String? stored) {
     if (stored == null) return null;
     if (stored.startsWith('http')) return stored;
     return Supabase.instance.client.storage
