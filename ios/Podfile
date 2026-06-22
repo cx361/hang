@@ -45,6 +45,10 @@ post_install do |installer|
       config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '14.0'
       # Verhindert Fehler bei Apple Silicon Simulatoren
       config.build_settings['ONLY_ACTIVE_ARCH'] = 'YES'
+      # Xcode 26 can fail signing pod frameworks for simulator builds.
+      # The app target is still signed; pod targets do not need signing here.
+      config.build_settings['CODE_SIGNING_ALLOWED[sdk=iphonesimulator*]'] = 'NO'
+      config.build_settings['CODE_SIGNING_REQUIRED[sdk=iphonesimulator*]'] = 'NO'
     end
   end
 

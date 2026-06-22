@@ -118,7 +118,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               child: Image.network(
                 _avatarUrl!,
                 fit: BoxFit.contain,
-                errorBuilder: (_, __, ___) => const Icon(
+                errorBuilder: (_, _, _) => const Icon(
                   Icons.broken_image,
                   color: Colors.white54,
                   size: 64,
@@ -834,7 +834,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                   trailing: Switch(
                     value: _isIncognito,
-                    activeColor: Colors.deepPurple,
+                    activeThumbColor: Colors.deepPurple,
                     activeTrackColor: Colors.deepPurple.withValues(alpha: 0.4),
                     onChanged: (value) {
                       if (value) {
@@ -891,7 +891,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                   trailing: Switch(
                     value: _showActivity,
-                    activeColor: Colors.green[400],
+                    activeThumbColor: Colors.green[400],
                     activeTrackColor: Colors.green[400]!.withValues(alpha: 0.4),
                     onChanged: (value) async {
                       final userId =
@@ -944,9 +944,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                   ? NetworkImage(_avatarUrl!)
                                   : null,
                               onBackgroundImageError: _avatarUrl != null
-                                  ? (_, __) {
-                                      if (mounted)
+                                  ? (_, _) {
+                                      if (mounted) {
                                         setState(() => _avatarLoadError = true);
+                                      }
                                     }
                                   : null,
                               child: _avatarUrl == null || _avatarLoadError

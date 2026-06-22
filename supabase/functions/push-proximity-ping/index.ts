@@ -34,6 +34,20 @@ Deno.serve(async (req: Request) => {
     unknown
   >;
 
+  // Heartbeat guard: _updateLastSeen() in the Flutter app sends UPDATE events
+  // that only change last_seen_at, keeping pinged_at identical.  Detect these
+  // and skip the push — they are session keepalives, not new pings.
+  const eventType = payload.type as string | undefined;
+  const oldRecord = payload.old_record as Record<string, unknown> | undefined;
+  if (eventType === "UPDATE" && oldRecord) {
+    if (oldRecord["pinged_at"] === record["pinged_at"]) {
+      console.log("[push-proximity-ping] heartbeat update — skipping push");
+      return new Response(JSON.stringify({ skipped: "heartbeat" }), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+  }
+
   const triggeredBy = record["triggered_by_user_id"] as string | null;
   const userAId = record["user_a_id"] as string | null;
   const userBId = record["user_b_id"] as string | null;

@@ -463,6 +463,8 @@ class _FloatingNavBar extends StatelessWidget {
 }
 
 class _RadarTabState extends State<_RadarTab> {
+  // Debounce/in-flight guard for friend check
+  bool _isCheckingFriends = false;
   H3? h3;
   H3Index? currentH3Index;
   List<H3Index>? currentKRing;
@@ -794,7 +796,7 @@ class _RadarTabState extends State<_RadarTab> {
         logLevel: bg.Config.LOG_LEVEL_OFF,
         locationAuthorizationRequest: 'Always',
         showsBackgroundLocationIndicator: false,
-        heartbeatInterval: 60,
+        heartbeatInterval: 3600,
       ),
     ).then((bg.State state) {
       debugPrint('[location] Background geolocation ready');
@@ -982,68 +984,66 @@ class _RadarTabState extends State<_RadarTab> {
   Future<void> _checkFriendsInKRingFromSupabase(
     List<H3Index> kRingCells,
   ) async {
-    // Reload incognito and safe zone status before checking friends
-    await _loadIncognitoStatus();
-    await _loadSafeZoneStatus();
-    await _loadSilentZoneStatus();
-
-    // Disable friend detection when incognito
-    if (_isIncognito) {
-      debugPrint('[radar] Incognito Mode active - Friend detection disabled');
-      if (mounted) {
-        setState(() {
-          nearbyFriends = [];
-          statusText = 'Incognito Mode: Radar disabled';
-        });
-      }
-      return;
-    }
-
-    // Disable friend detection when in safe zone
-    if (_isInSafeZone) {
-      debugPrint('[radar] Safe Zone active - Friend detection disabled');
-      if (mounted) {
-        setState(() {
-          nearbyFriends = [];
-          statusText = 'Safe Zone: Radar disabled';
-        });
-      }
-      return;
-    }
-
-    final hexesRes9 = kRingCells.map((h) => h.toRadixString(16)).toList();
-    if (!supabaseAvailable) return;
-
-    final currentUserId = Supabase.instance.client.auth.currentUser?.id;
-    if (currentUserId == null) return;
-
-    debugPrint(
-      '[supabase] Checking friends in kRing (${hexesRes9.length} cells)',
-    );
+    // Debounce/in-flight guard
+    if (_isCheckingFriends) return;
+    _isCheckingFriends = true;
     try {
-      // Get list of accepted friend IDs
-      final friendshipsAsRequester = await Supabase.instance.client
-          .from('friendships')
-          .select('addressee_id')
-          .eq('requester_id', currentUserId)
-          .eq('status', 'accepted');
+      // Reload incognito and safe zone status before checking friends
+      await _loadIncognitoStatus();
+      await _loadSafeZoneStatus();
+      await _loadSilentZoneStatus();
 
-      final friendshipsAsAddressee = await Supabase.instance.client
+      // Disable friend detection when incognito
+      if (_isIncognito) {
+        debugPrint('[radar] Incognito Mode active - Friend detection disabled');
+        if (mounted) {
+          setState(() {
+            nearbyFriends = [];
+            statusText = 'Incognito Mode: Radar disabled';
+          });
+        }
+        return;
+      }
+
+      // Disable friend detection when in safe zone
+      if (_isInSafeZone) {
+        debugPrint('[radar] Safe Zone active - Friend detection disabled');
+        if (mounted) {
+          setState(() {
+            nearbyFriends = [];
+            statusText = 'Safe Zone: Radar disabled';
+          });
+        }
+        return;
+      }
+
+      final hexesRes9 = kRingCells.map((h) => h.toRadixString(16)).toList();
+      if (!supabaseAvailable) return;
+
+      final currentUserId = Supabase.instance.client.auth.currentUser?.id;
+      if (currentUserId == null) return;
+
+      debugPrint(
+        '[supabase] Checking friends in kRing (${hexesRes9.length} cells)',
+      );
+      // --- Combined friendship query ---
+      final friendships = await Supabase.instance.client
           .from('friendships')
-          .select('requester_id')
-          .eq('addressee_id', currentUserId)
+          .select('requester_id, addressee_id')
+          .or('requester_id.eq.$currentUserId,addressee_id.eq.$currentUserId')
           .eq('status', 'accepted');
 
       final friendIds = <String>{};
-      for (final item in friendshipsAsRequester) {
+      for (final item in friendships) {
         final map = Map<String, dynamic>.from(item as Map);
-        final id = map['addressee_id'] as String?;
-        if (id != null) friendIds.add(id);
-      }
-      for (final item in friendshipsAsAddressee) {
-        final map = Map<String, dynamic>.from(item as Map);
-        final id = map['requester_id'] as String?;
-        if (id != null) friendIds.add(id);
+        final requester = map['requester_id'] as String?;
+        final addressee = map['addressee_id'] as String?;
+        if (requester != null && requester != currentUserId) {
+          friendIds.add(requester);
+        }
+        if (addressee != null && addressee != currentUserId) {
+          friendIds.add(addressee);
+        }
       }
 
       if (friendIds.isEmpty) {
@@ -1058,8 +1058,6 @@ class _RadarTabState extends State<_RadarTab> {
       }
 
       // Query profiles that are friends AND NOT in safe zone.
-      // Also fetch visibility_radius so we can apply min-kRing (privacy wins).
-      // is_in_silent_zone is fetched so ping suppression can check it per-friend.
       final resp = await Supabase.instance.client
           .from('profiles')
           .select(
@@ -1069,9 +1067,6 @@ class _RadarTabState extends State<_RadarTab> {
           .eq('is_in_safe_zone', false)
           .timeout(const Duration(seconds: 15));
 
-      // For each friend apply effectiveK = min(my radius, friend's radius)
-      // individually — building a union first is wrong because a large radius
-      // from one friend would bleed into the check for a short-radius friend.
       final now = DateTime.now().toUtc();
       final visibleFriends = resp.where((friend) {
         // Incognito check
@@ -1098,7 +1093,7 @@ class _RadarTabState extends State<_RadarTab> {
         return cells.map((c) => c.toRadixString(16)).contains(friendHex);
       }).toList();
 
-      debugPrint('[supabase] Found ${visibleFriends.length} visible friends');
+      debugPrint('[supabase] Found \\${visibleFriends.length} visible friends');
       if (!mounted) return;
 
       setState(() {
@@ -1175,6 +1170,8 @@ class _RadarTabState extends State<_RadarTab> {
         statusText = 'Error querying friends.';
         supabaseRawResponse = '$e';
       });
+    } finally {
+      _isCheckingFriends = false;
     }
   }
 
