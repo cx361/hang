@@ -139,20 +139,15 @@ class ValidationHelpers {
         return null;
       }
 
-      // Handle leading zero (German number format) → convert to +49
-      if (normalized.startsWith('0') && !normalized.startsWith('00')) {
-        normalized = '+49${normalized.substring(1)}';
-      }
-
-      // If no country code prefix, add default
-      if (!normalized.startsWith('+')) {
-        // Assume it's missing the country code; add default
-        normalized = defaultCountryCode + normalized;
-      }
-
-      // Validate: should start with + and contain only digits after that
+      // Validate: must start with + and contain only digits after that
       if (!normalized.startsWith('+') || !RegExp(r'^\+\d{7,15}$').hasMatch(normalized)) {
         debugLog('hashPhoneE164', 'Invalid phone format: $normalized');
+        return null;
+      }
+
+      // Reject trunk prefix 0 after country code (e.g. +490176 instead of +49176)
+      if (RegExp(r'^\+\d{2}0').hasMatch(normalized)) {
+        debugLog('hashPhoneE164', 'Trunk prefix 0 detected: $normalized');
         return null;
       }
 

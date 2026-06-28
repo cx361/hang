@@ -224,7 +224,6 @@ class ProximityService {
             .from('profiles')
             .update({
               'apns_token': token,
-              'apns_token_updated_at': DateTime.now().toUtc().toIso8601String(),
             })
             .eq('id', userId);
         _log('[proximity] APNs token saved and rotated');

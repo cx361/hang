@@ -637,6 +637,7 @@ class _FloatingNavBar extends StatelessWidget {
 class _RadarTabState extends State<_RadarTab> {
   // Debounce/in-flight guard for friend check
   bool _isCheckingFriends = false;
+  DateTime? _lastRadarScanAt; // Throttle full friend scans to 90s minimum
   H3? h3;
   H3Index? currentH3Index;
   List<H3Index>? currentKRing;
@@ -653,6 +654,12 @@ class _RadarTabState extends State<_RadarTab> {
   int _visibilityRadius = 2; // kRing (1 = ~500m, 2 = ~1.5km, 3 = ~3km)
   bool _radiusLoaded = false;
 
+  // Timestamp (UTC) of the last successful location write to Supabase.
+  // Used to relax the accuracy gate when our DB sector has gone stale, so a
+  // coarse background fix can still update us instead of leaving the sector
+  // frozen for hours.
+  DateTime? _lastLocationWriteAt;
+
   // Debug panel
   final List<String> _debugLog = [];
   bool _showDebug = false;
@@ -663,6 +670,87 @@ class _RadarTabState extends State<_RadarTab> {
     _debugLog.insert(0, '[$ts] $msg');
     if (_debugLog.length > 30) _debugLog.removeLast();
     if (mounted) setState(() {});
+  }
+
+  /// Fetches the plugin's native SQLite log and shows it in a scrollable
+  /// dialog. Unlike the in-memory [_debugLog] (capped at 30 lines and wiped on
+  /// every app relaunch), this log is written natively even while the app is
+  /// backgrounded or terminated and persists for [Config.logMaxDays] (default
+  /// 3 days) — so it captures overnight background-location activity.
+  Future<void> _showDeviceLog() async {
+    String log;
+    try {
+      log = await bg.Logger.getLog();
+    } catch (e) {
+      log = 'Failed to load device log: $e';
+    }
+    if (!mounted) return;
+
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) {
+        final media = MediaQuery.of(ctx);
+        return Dialog(
+          insetPadding: const EdgeInsets.all(12),
+          child: SizedBox(
+            width: double.infinity,
+            height: media.size.height * 0.8,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 12, 8, 8),
+                  child: Row(
+                    children: [
+                      const Expanded(
+                        child: Text(
+                          'Device log',
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 16,
+                          ),
+                        ),
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.copy, size: 18),
+                        tooltip: 'Copy',
+                        onPressed: () async {
+                          await Clipboard.setData(ClipboardData(text: log));
+                          if (ctx.mounted) {
+                            ScaffoldMessenger.of(ctx).showSnackBar(
+                              const SnackBar(content: Text('Log copied')),
+                            );
+                          }
+                        },
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.close, size: 18),
+                        tooltip: 'Close',
+                        onPressed: () => Navigator.of(ctx).pop(),
+                      ),
+                    ],
+                  ),
+                ),
+                const Divider(height: 1),
+                Expanded(
+                  child: SingleChildScrollView(
+                    padding: const EdgeInsets.all(12),
+                    child: SelectableText(
+                      log.isEmpty ? '(log empty)' : log,
+                      style: const TextStyle(
+                        fontFamily: 'Courier',
+                        fontSize: 10,
+                        height: 1.4,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
   }
 
   bool get hasNearbyFriends => nearbyFriends.isNotEmpty;
@@ -1025,7 +1113,11 @@ class _RadarTabState extends State<_RadarTab> {
             stopOnTerminate: false,
             startOnBoot: true,
             debug: false,
-            logLevel: bg.Config.LOG_LEVEL_OFF,
+            // VERBOSE keeps a native SQLite event log (motion changes, GPS
+            // samples, heartbeats, HTTP) retrievable via
+            // BackgroundGeolocation.logger.getLog()/emailLog() — essential for
+            // diagnosing why background updates stop firing.
+            logLevel: bg.Config.LOG_LEVEL_VERBOSE,
             locationAuthorizationRequest: 'Always',
             showsBackgroundLocationIndicator: false,
             heartbeatInterval: 3600,
@@ -1051,12 +1143,24 @@ class _RadarTabState extends State<_RadarTab> {
         });
 
     bg.BackgroundGeolocation.onLocation(_onLocation, _onLocationError);
-    bg.BackgroundGeolocation.onHeartbeat((bg.HeartbeatEvent event) {
+    bg.BackgroundGeolocation.onHeartbeat((bg.HeartbeatEvent event) async {
       final ts = DateTime.now().toLocal().toString().substring(11, 19);
-      _dbg(
-        '📍 HEARTBEAT [$ts] triggered proximity check (location stale—checking anyway)',
-      );
-      _refreshSector();
+      _dbg('📍 HEARTBEAT [$ts] requesting fresh location');
+      // Actively fetch a new fix instead of re-scanning the stale cell.
+      // getCurrentPosition() persists + emits through the onLocation stream,
+      // so _onLocation runs and updates the DB. This is the hourly recovery
+      // path for when the OS stops delivering motion-triggered locations.
+      try {
+        await bg.BackgroundGeolocation.getCurrentPosition(
+          desiredAccuracy: bg.Config.DESIRED_ACCURACY_HIGH,
+          maximumAge: 0,
+          samples: 1,
+          timeout: 30,
+        );
+      } catch (e) {
+        _dbg('Heartbeat getCurrentPosition failed: $e — using cached sector');
+        _refreshSector();
+      }
     });
     bg.BackgroundGeolocation.start();
 
@@ -1100,15 +1204,35 @@ class _RadarTabState extends State<_RadarTab> {
     }
 
     const double kMinAccuracyMeters = 250.0;
+    // When our DB sector is stale, accept coarser fixes up to this bound so a
+    // background network/significant-location-change fix (often >250m) can
+    // still update us. A coarse sector beats an hours-frozen one.
+    const double kCoarseAccuracyMeters = 1000.0;
+    const staleThreshold = Duration(minutes: 30);
+
     if (acc > kMinAccuracyMeters) {
-      _dbg('Skipping low-accuracy fix: ±${acc.toStringAsFixed(0)}m');
-      if (mounted) {
-        setState(
-          () =>
-              statusText = 'Waiting for GPS fix (±${acc.toStringAsFixed(0)}m)…',
+      final lastWrite = _lastLocationWriteAt;
+      final isStale =
+          lastWrite == null ||
+          DateTime.now().toUtc().difference(lastWrite) > staleThreshold;
+
+      if (!isStale || acc > kCoarseAccuracyMeters) {
+        _dbg(
+          'Skipping low-accuracy fix: ±${acc.toStringAsFixed(0)}m (stale=$isStale)',
         );
+        if (mounted) {
+          setState(
+            () => statusText =
+                'Waiting for GPS fix (±${acc.toStringAsFixed(0)}m)…',
+          );
+        }
+        return;
       }
-      return;
+
+      // Stale sector + tolerable accuracy → accept the coarse fix anyway.
+      _dbg(
+        'Accepting coarse fix ±${acc.toStringAsFixed(0)}m — DB sector was stale',
+      );
     }
 
     H3Index cell;
@@ -1139,21 +1263,40 @@ class _RadarTabState extends State<_RadarTab> {
       });
     }
 
-    // Update user's location in Supabase (must complete before scanning
+    // Update user's location in Supabase immediately (must complete before scanning
     // so is_in_silent_zone is current in both the DB and local state before
     // checkAndPing decides whether to suppress notifications).
-    await _updateUserLocation(cell);
+    final zoneResults = await _updateUserLocation(cell);
 
-    _checkFriendsInKRing(kRingCells);
+    // Throttle full radar scans to 90s minimum to reduce query volume during movement.
+    // A user on Autobahn would trigger every 26s otherwise = 138 scans/hour.
+    // With throttle: ~40 scans/hour, same proximity detection, 3x less DB load.
+    final now = DateTime.now().toUtc();
+    final timeSinceLastScan = _lastRadarScanAt != null
+        ? now.difference(_lastRadarScanAt!)
+        : const Duration(hours: 1);
+
+    if (timeSinceLastScan.inSeconds >= 90) {
+      _lastRadarScanAt = now;
+      _checkFriendsInKRing(kRingCells, zoneResults);
+    } else {
+      _dbg(
+        '⏸️ Radar scan throttled (${timeSinceLastScan.inSeconds}s since last, need 90s)',
+      );
+    }
   }
 
-  Future<void> _updateUserLocation(H3Index cell) async {
-    if (!supabaseAvailable) return;
+  /// Returns a map of zone check results {safe, silent} to avoid re-querying
+  /// the same data in _checkFriendsInKRing.
+  Future<Map<String, dynamic>> _updateUserLocation(H3Index cell) async {
+    if (!supabaseAvailable) {
+      return {'safe': false, 'silent': false};
+    }
 
     final user = Supabase.instance.client.auth.currentUser;
     if (user == null) {
       debugPrint('[location] No authenticated user, skipping location update');
-      return;
+      return {'safe': false, 'silent': false};
     }
 
     try {
@@ -1207,12 +1350,17 @@ class _RadarTabState extends State<_RadarTab> {
           })
           .eq('id', user.id);
 
+      _lastLocationWriteAt = DateTime.now().toUtc();
+
       if (mounted) {
         setState(() => _isInSilentZone = isInSilentZone);
       }
       ProximityService.instance.updateSilentZoneStatus(isInSilentZone);
+
+      return {'safe': isInSafeZone, 'silent': isInSilentZone};
     } catch (e) {
-      debugPrint('[location] Failed to update user location: $e');
+      _dbg('❌ Failed to update user location: $e');
+      return {'safe': false, 'silent': false};
     }
   }
 
@@ -1223,9 +1371,10 @@ class _RadarTabState extends State<_RadarTab> {
     }
   }
 
-  void _checkFriendsInKRing(List<H3Index> kRingCells) {
+  void _checkFriendsInKRing(List<H3Index> kRingCells,
+      [Map<String, dynamic>? cachedZoneResults]) {
     if (supabaseAvailable) {
-      _checkFriendsInKRingFromSupabase(kRingCells);
+      _checkFriendsInKRingFromSupabase(kRingCells, cachedZoneResults);
       return;
     }
 
@@ -1238,8 +1387,9 @@ class _RadarTabState extends State<_RadarTab> {
   }
 
   Future<void> _checkFriendsInKRingFromSupabase(
-    List<H3Index> kRingCells,
-  ) async {
+    List<H3Index> kRingCells, [
+    Map<String, dynamic>? cachedZoneResults,
+  ]) async {
     // Debounce/in-flight guard
     if (_isCheckingFriends) return;
     _isCheckingFriends = true;
@@ -1250,11 +1400,28 @@ class _RadarTabState extends State<_RadarTab> {
       final currentUserId = Supabase.instance.client.auth.currentUser?.id;
       if (currentUserId == null) return;
 
-      // CRITICAL: Load zone status fresh from DB BEFORE friend check
-      // This ensures safety zones, silent zones, and incognito status are current
+      // CRITICAL: Load incognito status fresh (not cached), but reuse zone results
+      // from _updateUserLocation to avoid re-querying safe_zones/silent_zones.
       await _loadIncognitoStatus();
-      await _loadSafeZoneStatus();
-      await _loadSilentZoneStatus();
+      
+      // Use cached zone results if available, otherwise load fresh.
+      bool isInSafeZone = cachedZoneResults?['safe'] ?? false;
+      bool isInSilentZone = cachedZoneResults?['silent'] ?? false;
+      
+      if (cachedZoneResults == null) {
+        // Fallback: load zones fresh if not passed in (e.g., from older code paths).
+        await _loadSafeZoneStatus();
+        await _loadSilentZoneStatus();
+      } else {
+        // Update local state with cached results.
+        if (mounted) {
+          setState(() {
+            _isInSafeZone = isInSafeZone;
+            _isInSilentZone = isInSilentZone;
+          });
+        }
+        ProximityService.instance.updateSilentZoneStatus(isInSilentZone);
+      }
 
       // Disable friend detection when incognito
       if (_isIncognito) {
@@ -1499,9 +1666,9 @@ class _RadarTabState extends State<_RadarTab> {
 
       // Update user's location in Supabase (await so silent zone status is
       // current before checkAndPing runs).
-      await _updateUserLocation(cell);
+      final zoneResults = await _updateUserLocation(cell);
 
-      _checkFriendsInKRing(kRingCells);
+      _checkFriendsInKRing(kRingCells, zoneResults);
     } catch (e) {
       debugPrint('[test] Error setting test location: $e');
     }
@@ -1871,6 +2038,15 @@ class _RadarTabState extends State<_RadarTab> {
                           ),
                         )
                         .toList(),
+                  ),
+                ),
+              if (_showDebug && (Platform.isIOS || Platform.isAndroid))
+                Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: TextButton.icon(
+                    onPressed: _showDeviceLog,
+                    icon: const Icon(Icons.description_outlined, size: 16),
+                    label: const Text('View device log (persisted)'),
                   ),
                 ),
               const SizedBox(height: 8),

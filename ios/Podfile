@@ -1,7 +1,5 @@
-# Uncomment this line to define a global platform for your project
 platform :ios, '14.0'
 
-# CocoaPods analytics sends network stats synchronously affecting flutter build latency.
 ENV['COCOAPODS_DISABLE_STATS'] = 'true'
 
 project 'Runner', {
@@ -28,8 +26,8 @@ require File.expand_path(File.join('packages', 'flutter_tools', 'bin', 'podhelpe
 flutter_ios_podfile_setup
 
 target 'Runner' do
-  use_frameworks! :linkage => :static
-
+  # CHANGED: Remove static linkage — let each pod decide
+  # This allows h3_flutter to work properly with FFI
   flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
   target 'RunnerTests' do
     inherit! :search_paths
@@ -37,52 +35,65 @@ target 'Runner' do
 end
 
 post_install do |installer|
+  # CRITICAL: Add force_load for h3.xcframework to Runner's xcconfig files
   installer.pods_project.targets.each do |target|
     flutter_additional_ios_build_settings(target)
     
+    # Standard settings for all targets
     target.build_configurations.each do |config|
-      # Das hier stellt sicher, dass alle Pods die gleiche iOS-Version nutzen
       config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '14.0'
-      # Verhindert Fehler bei Apple Silicon Simulatoren
       config.build_settings['ONLY_ACTIVE_ARCH'] = 'YES'
-      # Xcode 26 can fail signing pod frameworks for simulator builds.
-      # The app target is still signed; pod targets do not need signing here.
       config.build_settings['CODE_SIGNING_ALLOWED[sdk=iphonesimulator*]'] = 'NO'
       config.build_settings['CODE_SIGNING_REQUIRED[sdk=iphonesimulator*]'] = 'NO'
     end
   end
 
-  # Fix: force-load libh3.a so all C symbols (e.g. degsToRads) are available
-  # for Dart FFI's DynamicLibrary.process() lookup at runtime.
-  #
-  # Using a helper variable H3_FORCE_LOAD avoids the bug where setting
-  # OTHER_LDFLAGS[sdk=iphoneos*] replaces the unconditional OTHER_LDFLAGS
-  # (losing -ObjC, -l"h3", all framework flags). Instead OTHER_LDFLAGS stays
-  # unconditional and expands $(H3_FORCE_LOAD) which is SDK-conditional.
-  %w[Pods-Runner].each do |target_name|
-    %w[debug release].each do |config_name|
-      xcconfig_path = File.join(installer.sandbox.root.to_s, 'Target Support Files', target_name, "#{target_name}.#{config_name}.xcconfig")
-      next unless File.exist?(xcconfig_path)
+  # Modify xcconfig files directly to add force_load for h3
+  podfile_dir = File.dirname(__FILE__)
+  pods_target_support_dir = File.join(podfile_dir, 'Pods', 'Target Support Files', 'Pods-Runner')
+  
+  # Platform-specific paths for h3
+  h3_force_load_device = '-force_load ${SRCROOT}/../.symlinks/plugins/h3_flutter/darwin/Libs/h3.xcframework/ios-arm64/libh3.a'
+  h3_force_load_simulator = '-force_load ${SRCROOT}/../.symlinks/plugins/h3_flutter/darwin/Libs/h3.xcframework/ios-arm64_x86_64-simulator/libh3.a'
+  
+  ['Pods-Runner.debug.xcconfig', 'Pods-Runner.release.xcconfig', 'Pods-Runner.profile.xcconfig'].each do |config_file|
+    config_path = File.join(pods_target_support_dir, config_file)
+    next unless File.exist?(config_path)
+    
+    content = File.read(config_path)
+    
+    # Add force_load for h3 if not already there
+    unless content.include?('-force_load')
+      # Add platform-specific force_load definitions at the top
+      new_content = "H3_FORCE_LOAD[sdk=iphonesimulator*] = #{h3_force_load_simulator}\nH3_FORCE_LOAD[sdk=iphoneos*] = #{h3_force_load_device}\n\n"
+      
+      # Replace in OTHER_LDFLAGS
+      new_content += content.gsub(
+        /(-l"h3")/,
+        '$(H3_FORCE_LOAD) \1'
+      )
+      
+      File.write(config_path, new_content)
+      puts "✅ Added conditional force_load to #{config_file}"
+    end
 
-      contents = File.read(xcconfig_path)
-      next if contents.include?('H3_FORCE_LOAD')
-
-      # Remove old broken conditional flags if present from a previous install
-      contents = contents.gsub(/\nOTHER_LDFLAGS\[sdk=.*?\] = .*/, '')
-
-      sim_lib  = '"$(PODS_ROOT)/../.symlinks/plugins/h3_flutter/darwin/Libs/h3.xcframework/ios-arm64_x86_64-simulator/libh3.a"'
-      ios_lib  = '"$(PODS_ROOT)/../.symlinks/plugins/h3_flutter/darwin/Libs/h3.xcframework/ios-arm64/libh3.a"'
-
-      # Append the sdk-conditional helper and reference it from OTHER_LDFLAGS
-      contents = contents.gsub(/^(OTHER_LDFLAGS = .*)$/) do |match|
-        <<~XCCONFIG.chomp
-          H3_FORCE_LOAD[sdk=iphoneos*] = -force_load #{ios_lib}
-          H3_FORCE_LOAD[sdk=iphonesimulator*] = -force_load #{sim_lib}
-          #{match} $(H3_FORCE_LOAD)
-        XCCONFIG
-      end
-
-      File.write(xcconfig_path, contents)
+    # CRITICAL: Keep H3 symbols in the Release/device binary.
+    # h3_flutter resolves C functions at runtime by name via dlsym
+    # (e.g. degsToRads). Two separate Release-only optimizations break this:
+    #   1. Dead-code stripping (-dead_strip) removes the force-loaded H3
+    #      objects because nothing references them at compile time (the FFI
+    #      lookups happen at runtime). -> DEAD_CODE_STRIPPING = NO
+    #   2. Symbol stripping removes the symbol names dlsym needs.
+    #      -> STRIP_INSTALLED_PRODUCT = NO / STRIP_STYLE = non-global
+    # Debug/simulator builds skip both, which is why they keep working while
+    # the TestFlight (Release/device) archive fails with "symbol not found".
+    content = File.read(config_path)
+    unless content.include?('DEAD_CODE_STRIPPING')
+      File.write(
+        config_path,
+        "DEAD_CODE_STRIPPING = NO\nSTRIP_STYLE = non-global\nSTRIP_INSTALLED_PRODUCT = NO\nDEPLOYMENT_POSTPROCESSING = NO\n\n" + content
+      )
+      puts "✅ Disabled dead-code/symbol stripping (keep H3 FFI symbols) in #{config_file}"
     end
   end
 end

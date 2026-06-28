@@ -200,8 +200,9 @@ class _FriendsScreenState extends State<FriendsScreen>
   }
 
   Future<void> _loadMoreFriends() async {
-    if (_currentUserId == null || _isLoadingMoreFriends || !_hasMoreFriends)
+    if (_currentUserId == null || _isLoadingMoreFriends || !_hasMoreFriends) {
       return;
+    }
 
     _isLoadingMoreFriends = true;
 
@@ -356,8 +357,9 @@ class _FriendsScreenState extends State<FriendsScreen>
         // Skip current user, duplicates, and null IDs
         if (userId == null ||
             userId == _currentUserId ||
-            resultIds.contains(userId))
+            resultIds.contains(userId)) {
           continue;
+        }
         resultIds.add(userId);
 
         // Mark status for UI
@@ -966,6 +968,7 @@ class _FriendsScreenState extends State<FriendsScreen>
                     ? _buildShareHangPrompt()
                     : Center(child: Text(_isIncognito ? '' : 'No users found'))
               : ListView.builder(
+                  padding: const EdgeInsets.only(bottom: 140),
                   itemCount: _searchResults.length,
                   itemBuilder: (context, index) {
                     final user = _searchResults[index];
@@ -1082,6 +1085,7 @@ class _FriendsScreenState extends State<FriendsScreen>
     }
 
     return ListView.builder(
+      padding: const EdgeInsets.only(bottom: 140),
       itemCount: _pendingRequests.length,
       itemBuilder: (context, index) {
         final request = _pendingRequests[index];
@@ -1148,6 +1152,7 @@ class _FriendsScreenState extends State<FriendsScreen>
     }
 
     return ListView.builder(
+      padding: const EdgeInsets.only(bottom: 140),
       itemCount: _friendsList.length,
       itemBuilder: (context, index) {
         final friend = _friendsList[index];
@@ -1294,13 +1299,23 @@ class _FriendsScreenState extends State<FriendsScreen>
                   keyboardType: TextInputType.phone,
                   decoration: InputDecoration(
                     labelText: 'Your phone number',
-                    hintText: '+49 171 1234567',
+                    hintText: '+491711234567',
                     errorText: _myPhoneError,
                     border: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(12),
                     ),
                   ),
-                  onChanged: (_) {
+                  onChanged: (value) {
+                    // Strip everything except digits and leading +
+                    final stripped = value.replaceAll(RegExp(r'[^\d+]'), '');
+                    if (stripped != value) {
+                      _myPhoneController.value = TextEditingValue(
+                        text: stripped,
+                        selection: TextSelection.collapsed(
+                          offset: stripped.length,
+                        ),
+                      );
+                    }
                     if (_myPhoneError != null) {
                       setState(() {
                         _myPhoneError = null;
