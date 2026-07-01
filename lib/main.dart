@@ -961,6 +961,15 @@ class _RadarTabState extends State<_RadarTab> {
       100; // Current distanceFilter (m), matches Config
   bg.Location? _lastLocationForDistance; // For distance-based speed calculation
 
+  // Set true by onHeartbeat right before its getCurrentPosition() so the
+  // resulting _onLocation bypasses the same-cell guard. While sitting still in
+  // one H3 cell the guard would otherwise skip both the updated_at write and
+  // the friend scan — freezing last_seen_at, letting the 3h cooldown lapse, and
+  // risking a departure ping after >=3h together. Forcing the scan lets
+  // checkAndPing heartbeat last_seen_at (ping stays suppressed) and keeps our
+  // updated_at fresh.
+  bool _forceScanFromHeartbeat = false;
+
   void _dbg(String msg) {
     final ts = DateTime.now().toLocal().toString().substring(11, 19);
     debugPrint('[dbg] $msg');
@@ -1491,6 +1500,9 @@ class _RadarTabState extends State<_RadarTab> {
       // getCurrentPosition() persists + emits through the onLocation stream,
       // so _onLocation runs and updates the DB. This is the hourly recovery
       // path for when the OS stops delivering motion-triggered locations.
+      // Force the ensuing _onLocation to scan even if we're still in the same
+      // cell, so last_seen_at keeps refreshing during a long stationary session.
+      _forceScanFromHeartbeat = true;
       try {
         await bg.BackgroundGeolocation.getCurrentPosition(
           desiredAccuracy: bg.Config.DESIRED_ACCURACY_HIGH,
@@ -1596,9 +1608,16 @@ class _RadarTabState extends State<_RadarTab> {
       return;
     }
 
+    // Consume the heartbeat force-scan flag: an hourly heartbeat must refresh
+    // updated_at + last_seen_at even without a cell change (see field docs).
+    final forceScan = _forceScanFromHeartbeat;
+    _forceScanFromHeartbeat = false;
+
     // Skip if we're already in this cell — avoids duplicate Supabase calls
     // when start(), getCurrentPosition() and a cached event all fire at once.
-    if (cell == currentH3Index) {
+    // A heartbeat-forced scan bypasses this so long stationary sessions still
+    // heartbeat last_seen_at (keeping the cooldown alive) and bump updated_at.
+    if (cell == currentH3Index && !forceScan) {
       debugPrint('[location] Same cell as before, skipping update');
       return;
     }
