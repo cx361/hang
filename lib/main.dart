@@ -1,6 +1,6 @@
 import 'dart:async';
-import 'dart:io' show Platform, File;
-import 'dart:math' show cos, max, min, pi, sin, sqrt;
+import 'dart:io' show Platform, File, Directory;
+import 'dart:math' show atan2, cos, max, min, pi, sin, sqrt;
 import 'dart:ui' show ImageFilter;
 
 import 'package:flutter/foundation.dart';
@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_background_geolocation/flutter_background_geolocation.dart'
     as bg;
+import 'package:share_plus/share_plus.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:h3_flutter/h3_flutter.dart';
 import 'package:package_info_plus/package_info_plus.dart';
@@ -23,6 +24,295 @@ import 'onboarding_screen.dart';
 import 'profile_screen.dart';
 import 'proximity_service.dart';
 import 'settings_screen.dart';
+
+// ─── Transport Mode Classification ──────────────────────────────────────────
+enum TransportMode { stationary, walking, cycling, transit, highway }
+
+enum DataSource { activityRecognition, gpsSpeed, distanceSpeed, fallback }
+
+class TransportModeClassification {
+  final TransportMode mode;
+  final DataSource primarySource;
+  final double? confidence; // 0.0-1.0
+  final String reasoning; // For logging
+  final double? speedKmh; // Computed speed
+  final String? activityType; // Raw activity type from native API
+  final double? speedAccuracy; // GPS speed accuracy in m/s
+
+  TransportModeClassification({
+    required this.mode,
+    required this.primarySource,
+    this.confidence,
+    required this.reasoning,
+    this.speedKmh,
+    this.activityType,
+    this.speedAccuracy,
+  });
+}
+
+class ActivityClassifier {
+  /// Classifies transport mode using hybrid approach:
+  /// 1. Activity Recognition (native API, PRIMARY)
+  /// 2. GPS Speed (with confidence check)
+  /// 3. Distance/Time calculation (fallback)
+  /// 4. Last known mode (ultimate fallback)
+  static TransportModeClassification classifyTransportMode({
+    required bg.Location location,
+    required bg.Location? previousLocation,
+    required TransportMode? lastKnownMode,
+  }) {
+    // Source 1: Activity Recognition (PRIMARY)
+    final activityType = location.activity.type;
+    if (activityType.isNotEmpty) {
+      final classification = _classifyFromActivity(
+        activityType,
+        location.coords.speed,
+        speedAccuracy: location.coords.speedAccuracy,
+      );
+      if (classification != null) return classification;
+    }
+
+    // Source 2: GPS Speed (with confidence check).
+    // speed / speedAccuracy are -1 when unavailable, so `speed >= 0` guards
+    // that; a negative (unknown) accuracy is treated as acceptable.
+    if (location.coords.speed >= 0 && location.coords.speedAccuracy < 15) {
+      final speedKmh = location.coords.speed * 3.6;
+      final classification = _classifyFromSpeed(speedKmh);
+      if (classification != null) return classification;
+    }
+
+    // Source 3: Distance/Time fallback
+    if (previousLocation != null) {
+      try {
+        final distance = _distanceBetween(
+          previousLocation.coords.latitude,
+          previousLocation.coords.longitude,
+          location.coords.latitude,
+          location.coords.longitude,
+        );
+        final timeDiffSeconds =
+            DateTime.parse(location.timestamp)
+                .difference(DateTime.parse(previousLocation.timestamp))
+                .inMilliseconds /
+            1000.0;
+        if (timeDiffSeconds > 0.5) {
+          // Avoid division by very small numbers
+          final speedKmh = (distance / timeDiffSeconds) * 3.6;
+          final classification = _classifyFromSpeed(speedKmh);
+          if (classification != null) {
+            return classification.copyWith(
+              primarySource: DataSource.distanceSpeed,
+              reasoning:
+                  'Distance-based speed fallback: ${speedKmh.toStringAsFixed(1)} km/h',
+            );
+          }
+        }
+      } catch (e) {
+        debugPrint('[classifier] Distance calc error: $e');
+      }
+    }
+
+    // Source 4: Last known mode
+    if (lastKnownMode != null) {
+      return TransportModeClassification(
+        mode: lastKnownMode,
+        primarySource: DataSource.fallback,
+        confidence: 0.3,
+        reasoning: 'Using last known mode (all sources failed)',
+        speedKmh: null,
+        activityType: null,
+        speedAccuracy: null,
+      );
+    }
+
+    // Ultimate fallback to STATIONARY
+    return TransportModeClassification(
+      mode: TransportMode.stationary,
+      primarySource: DataSource.fallback,
+      confidence: 0.1,
+      reasoning: 'No data sources available, defaulting to STATIONARY',
+      speedKmh: 0,
+      activityType: null,
+      speedAccuracy: null,
+    );
+  }
+
+  static TransportModeClassification? _classifyFromActivity(
+    String activityType,
+    double? gpsSpeedMs, {
+    double? speedAccuracy,
+  }) {
+    switch (activityType.toLowerCase()) {
+      case 'still':
+        return TransportModeClassification(
+          mode: TransportMode.stationary,
+          primarySource: DataSource.activityRecognition,
+          confidence: 0.95,
+          reasoning: 'Activity Recognition: still',
+          speedKmh: 0,
+          activityType: activityType,
+          speedAccuracy: speedAccuracy,
+        );
+      case 'walking':
+        return TransportModeClassification(
+          mode: TransportMode.walking,
+          primarySource: DataSource.activityRecognition,
+          confidence: 0.90,
+          reasoning: 'Activity Recognition: walking',
+          speedKmh: (gpsSpeedMs ?? 1.4) * 3.6,
+          activityType: activityType,
+          speedAccuracy: speedAccuracy,
+        );
+      case 'on_bicycle':
+      case 'on_bike':
+        return TransportModeClassification(
+          mode: TransportMode.cycling,
+          primarySource: DataSource.activityRecognition,
+          confidence: 0.85,
+          reasoning: 'Activity Recognition: on_bicycle',
+          speedKmh: (gpsSpeedMs ?? 6.0) * 3.6,
+          activityType: activityType,
+          speedAccuracy: speedAccuracy,
+        );
+      case 'in_vehicle':
+        // Sub-classify based on speed
+        if (gpsSpeedMs != null && gpsSpeedMs >= 0) {
+          if (gpsSpeedMs > 22) {
+            // > 80 km/h
+            return TransportModeClassification(
+              mode: TransportMode.highway,
+              primarySource: DataSource.activityRecognition,
+              confidence: 0.95,
+              reasoning:
+                  'Activity Recognition: in_vehicle + high speed (${(gpsSpeedMs * 3.6).toStringAsFixed(1)} km/h > 80)',
+              speedKmh: gpsSpeedMs * 3.6,
+              activityType: activityType,
+              speedAccuracy: speedAccuracy,
+            );
+          } else {
+            return TransportModeClassification(
+              mode: TransportMode.transit,
+              primarySource: DataSource.activityRecognition,
+              confidence: 0.92,
+              reasoning:
+                  'Activity Recognition: in_vehicle + moderate speed (${(gpsSpeedMs * 3.6).toStringAsFixed(1)} km/h)',
+              speedKmh: gpsSpeedMs * 3.6,
+              activityType: activityType,
+              speedAccuracy: speedAccuracy,
+            );
+          }
+        } else {
+          // No speed data, assume TRANSIT as safe default
+          return TransportModeClassification(
+            mode: TransportMode.transit,
+            primarySource: DataSource.activityRecognition,
+            confidence: 0.80,
+            reasoning: 'Activity Recognition: in_vehicle (no speed data)',
+            speedKmh: null,
+            activityType: activityType,
+            speedAccuracy: speedAccuracy,
+          );
+        }
+      default:
+        return null; // Unknown activity type, try next source
+    }
+  }
+
+  static TransportModeClassification? _classifyFromSpeed(double speedKmh) {
+    if (speedKmh < 0.5) {
+      return TransportModeClassification(
+        mode: TransportMode.stationary,
+        primarySource: DataSource.gpsSpeed,
+        confidence: 0.70,
+        reasoning: 'GPS Speed: ${speedKmh.toStringAsFixed(1)} km/h < 0.5',
+        speedKmh: speedKmh,
+        activityType: null,
+        speedAccuracy: null,
+      );
+    } else if (speedKmh < 4.0) {
+      return TransportModeClassification(
+        mode: TransportMode.walking,
+        primarySource: DataSource.gpsSpeed,
+        confidence: 0.65,
+        reasoning: 'GPS Speed: ${speedKmh.toStringAsFixed(1)} km/h (0.5-4.0)',
+        speedKmh: speedKmh,
+        activityType: null,
+        speedAccuracy: null,
+      );
+    } else if (speedKmh < 8.0) {
+      return TransportModeClassification(
+        mode: TransportMode.cycling,
+        primarySource: DataSource.gpsSpeed,
+        confidence: 0.60,
+        reasoning: 'GPS Speed: ${speedKmh.toStringAsFixed(1)} km/h (4.0-8.0)',
+        speedKmh: speedKmh,
+        activityType: null,
+        speedAccuracy: null,
+      );
+    } else if (speedKmh < 80.0) {
+      return TransportModeClassification(
+        mode: TransportMode.transit,
+        primarySource: DataSource.gpsSpeed,
+        confidence: 0.75,
+        reasoning: 'GPS Speed: ${speedKmh.toStringAsFixed(1)} km/h (8.0-80.0)',
+        speedKmh: speedKmh,
+        activityType: null,
+        speedAccuracy: null,
+      );
+    } else {
+      return TransportModeClassification(
+        mode: TransportMode.highway,
+        primarySource: DataSource.gpsSpeed,
+        confidence: 0.85,
+        reasoning: 'GPS Speed: ${speedKmh.toStringAsFixed(1)} km/h > 80.0',
+        speedKmh: speedKmh,
+        activityType: null,
+        speedAccuracy: null,
+      );
+    }
+  }
+
+  static double _distanceBetween(
+    double lat1,
+    double lon1,
+    double lat2,
+    double lon2,
+  ) {
+    // Haversine formula
+    const earthRadiusKm = 6371;
+    final dLat = _toRad(lat2 - lat1);
+    final dLon = _toRad(lon2 - lon1);
+    final a =
+        sin(dLat / 2) * sin(dLat / 2) +
+        cos(_toRad(lat1)) * cos(_toRad(lat2)) * sin(dLon / 2) * sin(dLon / 2);
+    final c = 2 * atan2(sqrt(a), sqrt(1 - a));
+    return earthRadiusKm * c * 1000; // Return in meters
+  }
+
+  static double _toRad(double degrees) => degrees * pi / 180;
+}
+
+extension on TransportModeClassification {
+  TransportModeClassification copyWith({
+    TransportMode? mode,
+    DataSource? primarySource,
+    double? confidence,
+    String? reasoning,
+    double? speedKmh,
+    String? activityType,
+    double? speedAccuracy,
+  }) {
+    return TransportModeClassification(
+      mode: mode ?? this.mode,
+      primarySource: primarySource ?? this.primarySource,
+      confidence: confidence ?? this.confidence,
+      reasoning: reasoning ?? this.reasoning,
+      speedKmh: speedKmh ?? this.speedKmh,
+      activityType: activityType ?? this.activityType,
+      speedAccuracy: speedAccuracy ?? this.speedAccuracy,
+    );
+  }
+}
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -637,7 +927,6 @@ class _FloatingNavBar extends StatelessWidget {
 class _RadarTabState extends State<_RadarTab> {
   // Debounce/in-flight guard for friend check
   bool _isCheckingFriends = false;
-  DateTime? _lastRadarScanAt; // Throttle full friend scans to 90s minimum
   H3? h3;
   H3Index? currentH3Index;
   List<H3Index>? currentKRing;
@@ -664,6 +953,14 @@ class _RadarTabState extends State<_RadarTab> {
   final List<String> _debugLog = [];
   bool _showDebug = false;
 
+  // Transport Mode Classification & History
+  TransportMode? _currentTransportMode; // Committed mode
+  TransportMode? _lastTransportMode; // Pending candidate (hysteresis)
+  int _transportModeConfirmationCount = 0; // Hysteresis counter
+  int _currentDistanceFilter =
+      100; // Current distanceFilter (m), matches Config
+  bg.Location? _lastLocationForDistance; // For distance-based speed calculation
+
   void _dbg(String msg) {
     final ts = DateTime.now().toLocal().toString().substring(11, 19);
     debugPrint('[dbg] $msg');
@@ -675,12 +972,55 @@ class _RadarTabState extends State<_RadarTab> {
   /// Fetches the plugin's native SQLite log and shows it in a scrollable
   /// dialog. Unlike the in-memory [_debugLog] (capped at 30 lines and wiped on
   /// every app relaunch), this log is written natively even while the app is
-  /// backgrounded or terminated and persists for [Config.logMaxDays] (default
-  /// 3 days) — so it captures overnight background-location activity.
+  /// backgrounded or terminated. We constrain this view to the last 24 hours.
+  Future<String> _getDeviceLogLast24h() async {
+    final end = DateTime.now();
+    final start = end.subtract(const Duration(hours: 24));
+    return bg.Logger.getLog(
+      bg.SQLQuery(start: start, end: end, order: bg.SQLQuery.ORDER_ASC),
+    );
+  }
+
+  Future<void> _saveDeviceLogAsText(String log, BuildContext ctx) async {
+    try {
+      final now = DateTime.now().toUtc();
+      final yyyy = now.year.toString().padLeft(4, '0');
+      final mm = now.month.toString().padLeft(2, '0');
+      final dd = now.day.toString().padLeft(2, '0');
+      final hh = now.hour.toString().padLeft(2, '0');
+      final min = now.minute.toString().padLeft(2, '0');
+      final ss = now.second.toString().padLeft(2, '0');
+      final stamp = '${yyyy}${mm}${dd}_${hh}${min}${ss}';
+
+      final file = File(
+        '${Directory.systemTemp.path}/hang_device_log_last24h_$stamp.txt',
+      );
+      await file.writeAsString(log);
+
+      await Share.shareXFiles(
+        [XFile(file.path, mimeType: 'text/plain')],
+        subject: 'hang device log (last 24h)',
+        text: 'hang device log (last 24h)',
+      );
+
+      if (ctx.mounted) {
+        ScaffoldMessenger.of(ctx).showSnackBar(
+          SnackBar(content: Text('Saved as text file: ${file.path}')),
+        );
+      }
+    } catch (e) {
+      if (ctx.mounted) {
+        ScaffoldMessenger.of(
+          ctx,
+        ).showSnackBar(SnackBar(content: Text('Failed to save log file: $e')));
+      }
+    }
+  }
+
   Future<void> _showDeviceLog() async {
     String log;
     try {
-      log = await bg.Logger.getLog();
+      log = await _getDeviceLogLast24h();
     } catch (e) {
       log = 'Failed to load device log: $e';
     }
@@ -704,7 +1044,7 @@ class _RadarTabState extends State<_RadarTab> {
                     children: [
                       const Expanded(
                         child: Text(
-                          'Device log',
+                          'Device log (last 24h)',
                           style: TextStyle(
                             fontWeight: FontWeight.bold,
                             fontSize: 16,
@@ -712,15 +1052,10 @@ class _RadarTabState extends State<_RadarTab> {
                         ),
                       ),
                       IconButton(
-                        icon: const Icon(Icons.copy, size: 18),
-                        tooltip: 'Copy',
+                        icon: const Icon(Icons.save_alt, size: 18),
+                        tooltip: 'Save as .txt',
                         onPressed: () async {
-                          await Clipboard.setData(ClipboardData(text: log));
-                          if (ctx.mounted) {
-                            ScaffoldMessenger.of(ctx).showSnackBar(
-                              const SnackBar(content: Text('Log copied')),
-                            );
-                          }
+                          await _saveDeviceLogAsText(log, ctx);
                         },
                       ),
                       IconButton(
@@ -1104,7 +1439,12 @@ class _RadarTabState extends State<_RadarTab> {
           bg.Config(
             reset: true,
             desiredAccuracy: bg.Config.DESIRED_ACCURACY_HIGH,
-            distanceFilter: 100.0,
+            distanceFilter:
+                100.0, // Will be updated dynamically based on transport mode
+            // Keep distanceFilter fixed at our per-mode value; the plugin
+            // otherwise inflates it to 200-400m at speed (elasticity), which
+            // delayed proximity detection.
+            disableElasticity: true,
             //useSignificantChangesOnly: true,
             stopTimeout:
                 3, // Wait 3 minutes of inactivity before shutting down GPS
@@ -1121,6 +1461,7 @@ class _RadarTabState extends State<_RadarTab> {
             locationAuthorizationRequest: 'Always',
             showsBackgroundLocationIndicator: false,
             heartbeatInterval: 3600,
+            geofenceProximityRadius: 0, // Disable geofence radius
           ),
         )
         .then((bg.State state) {
@@ -1183,13 +1524,16 @@ class _RadarTabState extends State<_RadarTab> {
     final lng = location.coords.longitude;
     final acc = location.coords.accuracy;
     final ts = DateTime.now().toLocal().toString().substring(11, 19);
+    final mode = _currentTransportMode?.name ?? 'unknown';
     if (kDebugMode) {
       _dbg(
-        '📍 GPS [$ts] ${lat.toStringAsFixed(5)},${lng.toStringAsFixed(5)} ±${acc.toStringAsFixed(0)}m mock=${location.mock}',
+        '📍 GPS [$ts] ${lat.toStringAsFixed(5)},${lng.toStringAsFixed(5)} ±${acc.toStringAsFixed(0)}m mock=${location.mock} | $mode ${_currentDistanceFilter}m',
       );
     } else {
       // Production: log without exact coordinates for privacy
-      _dbg('📍 GPS [$ts] accuracy±${acc.toStringAsFixed(0)}m');
+      _dbg(
+        '📍 GPS [$ts] accuracy±${acc.toStringAsFixed(0)}m | $mode ${_currentDistanceFilter}m',
+      );
     }
 
     if (h3 == null) {
@@ -1202,6 +1546,11 @@ class _RadarTabState extends State<_RadarTab> {
       _dbg('Skipping 0,0 coordinates (no GPS fix yet)');
       return;
     }
+
+    // Adapt the plugin's distanceFilter to how the user is moving (walking →
+    // tight 100m for prompt meetup detection; faster modes → looser to save
+    // battery). Runs on every fix, independent of the same-cell guard below.
+    unawaited(_updateTransportModeAndFilter(location));
 
     const double kMinAccuracyMeters = 250.0;
     // When our DB sector is stale, accept coarser fixes up to this bound so a
@@ -1268,21 +1617,92 @@ class _RadarTabState extends State<_RadarTab> {
     // checkAndPing decides whether to suppress notifications).
     final zoneResults = await _updateUserLocation(cell);
 
-    // Throttle full radar scans to 90s minimum to reduce query volume during movement.
-    // A user on Autobahn would trigger every 26s otherwise = 138 scans/hour.
-    // With throttle: ~40 scans/hour, same proximity detection, 3x less DB load.
-    final now = DateTime.now().toUtc();
-    final timeSinceLastScan = _lastRadarScanAt != null
-        ? now.difference(_lastRadarScanAt!)
-        : const Duration(hours: 1);
+    // Scan immediately on every distanceFilter-driven location update. The
+    // in-flight guard in _checkFriendsInKRingFromSupabase prevents overlapping
+    // queries, and last_seen_at + cooldown dedupe pings — so scanning on every
+    // move gives timely detection without extra pings. distanceFilter (set per
+    // transport mode) is now the single lever controlling scan frequency.
+    _checkFriendsInKRing(kRingCells, zoneResults);
+  }
 
-    if (timeSinceLastScan.inSeconds >= 90) {
-      _lastRadarScanAt = now;
-      _checkFriendsInKRing(kRingCells, zoneResults);
+  /// Maps a transport mode to the distanceFilter (meters) the plugin should
+  /// use. Tight while stationary/walking — meetups happen at these speeds and
+  /// we want prompt detection — and progressively looser at higher speeds where
+  /// 100m granularity is pointless and wastes battery. Elasticity is disabled,
+  /// so this is the single source of truth for update frequency.
+  int _distanceFilterForMode(TransportMode mode) {
+    switch (mode) {
+      case TransportMode.stationary:
+      case TransportMode.walking:
+        return 100;
+      case TransportMode.cycling:
+        return 150;
+      case TransportMode.transit:
+        return 300;
+      case TransportMode.highway:
+        // Deliberately NOT huge (e.g. 50km): _onLocation only fires when this
+        // filter is exceeded (elasticity off), and the classifier only runs
+        // inside _onLocation. Too large a value means the mode never downgrades
+        // to transit/walking while driving into a city — so friend scans stay
+        // suppressed until a full stop (motionchange). 2km keeps long-haul DB
+        // load low while still reclassifying shortly after the driver slows.
+        return 2000;
+    }
+  }
+
+  /// Classifies the current transport mode and, when it changes (with
+  /// hysteresis to avoid setConfig thrashing), reconfigures the plugin's
+  /// distanceFilter to match.
+  Future<void> _updateTransportModeAndFilter(bg.Location location) async {
+    final classification = ActivityClassifier.classifyTransportMode(
+      location: location,
+      previousLocation: _lastLocationForDistance,
+      lastKnownMode: _currentTransportMode,
+    );
+    _lastLocationForDistance = location;
+
+    final newMode = classification.mode;
+
+    // Already committed to this mode — clear any pending candidate.
+    if (newMode == _currentTransportMode) {
+      _lastTransportMode = newMode;
+      _transportModeConfirmationCount = 0;
+      return;
+    }
+
+    // Hysteresis: require consecutive confirmations of the same new candidate
+    // before committing, so a single noisy reading doesn't thrash setConfig.
+    if (newMode == _lastTransportMode) {
+      _transportModeConfirmationCount++;
     } else {
+      _lastTransportMode = newMode;
+      _transportModeConfirmationCount = 1;
+    }
+
+    const requiredConfirmations = 2;
+    if (_transportModeConfirmationCount < requiredConfirmations) return;
+
+    final previousMode = _currentTransportMode;
+    _currentTransportMode = newMode;
+    _transportModeConfirmationCount = 0;
+
+    final newFilter = _distanceFilterForMode(newMode);
+    if (newFilter == _currentDistanceFilter) {
       _dbg(
-        '⏸️ Radar scan throttled (${timeSinceLastScan.inSeconds}s since last, need 90s)',
+        '🚦 $previousMode→$newMode (distanceFilter unchanged ${newFilter}m)',
       );
+      return;
+    }
+    _currentDistanceFilter = newFilter;
+    try {
+      await bg.BackgroundGeolocation.setConfig(
+        bg.Config(distanceFilter: newFilter.toDouble()),
+      );
+      _dbg(
+        '🚦 $previousMode→$newMode | distanceFilter=${newFilter}m | ${classification.reasoning}',
+      );
+    } catch (e) {
+      _dbg('setConfig(distanceFilter=$newFilter) failed: $e');
     }
   }
 
@@ -1371,8 +1791,10 @@ class _RadarTabState extends State<_RadarTab> {
     }
   }
 
-  void _checkFriendsInKRing(List<H3Index> kRingCells,
-      [Map<String, dynamic>? cachedZoneResults]) {
+  void _checkFriendsInKRing(
+    List<H3Index> kRingCells, [
+    Map<String, dynamic>? cachedZoneResults,
+  ]) {
     if (supabaseAvailable) {
       _checkFriendsInKRingFromSupabase(kRingCells, cachedZoneResults);
       return;
@@ -1403,11 +1825,11 @@ class _RadarTabState extends State<_RadarTab> {
       // CRITICAL: Load incognito status fresh (not cached), but reuse zone results
       // from _updateUserLocation to avoid re-querying safe_zones/silent_zones.
       await _loadIncognitoStatus();
-      
+
       // Use cached zone results if available, otherwise load fresh.
       bool isInSafeZone = cachedZoneResults?['safe'] ?? false;
       bool isInSilentZone = cachedZoneResults?['silent'] ?? false;
-      
+
       if (cachedZoneResults == null) {
         // Fallback: load zones fresh if not passed in (e.g., from older code paths).
         await _loadSafeZoneStatus();
