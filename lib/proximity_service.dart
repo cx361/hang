@@ -8,7 +8,7 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 // In debug builds use a short cooldown so testing is easy.
-const _kCooldown = kDebugMode ? Duration(minutes: 1) : Duration(hours: 3);
+const _kCooldown = kDebugMode ? Duration(minutes: 1) : Duration(hours: 2);
 
 // Maximum age of a friend's last-known location before we refuse to ping.
 // If a friend's phone died / went offline, their stale H3 hex can linger in
@@ -222,9 +222,7 @@ class ProximityService {
       try {
         await Supabase.instance.client
             .from('profiles')
-            .update({
-              'apns_token': token,
-            })
+            .update({'apns_token': token})
             .eq('id', userId);
         _log('[proximity] APNs token saved and rotated');
         return;
@@ -538,6 +536,30 @@ class ProximityService {
       return;
     }
 
+    // Fetch incognito status once for all friends — avoids N identical DB reads.
+    bool isIncognito = false;
+    DateTime? incognitoUntil;
+    try {
+      final userProfile = await Supabase.instance.client
+          .from('profiles')
+          .select('is_incognito, incognito_until')
+          .eq('id', currentUserId)
+          .maybeSingle();
+      if (userProfile != null) {
+        isIncognito = userProfile['is_incognito'] as bool? ?? false;
+        final untilStr = userProfile['incognito_until'] as String?;
+        if (untilStr != null) {
+          String normalized = untilStr;
+          if (!untilStr.endsWith('Z') && !untilStr.contains('+')) {
+            normalized = '${untilStr}Z';
+          }
+          incognitoUntil = DateTime.tryParse(normalized)?.toUtc();
+        }
+      }
+    } catch (e) {
+      _log('[proximity] Error fetching incognito status: $e');
+    }
+
     for (final friend in nearbyFriends) {
       final friendId = friend['id'] as String?;
       if (friendId == null) continue;
@@ -577,9 +599,13 @@ class ProximityService {
       }
 
       final handle = (friend['handle'] as String?) ?? 'Jemand';
-      // CRITICAL: Double-check incognito status right before ping
-      // to prevent incognito status from being bypassed by timing attacks
-      await _tryPing(currentUserId, friendId, handle);
+      await _tryPing(
+        currentUserId,
+        friendId,
+        handle,
+        isIncognito: isIncognito,
+        incognitoUntil: incognitoUntil,
+      );
     }
   }
 
@@ -592,36 +618,18 @@ class ProximityService {
   Future<void> _tryPing(
     String currentUserId,
     String friendId,
-    String handle,
-  ) async {
+    String handle, {
+    bool isIncognito = false,
+    DateTime? incognitoUntil,
+  }) async {
     try {
-      final userProfile = await Supabase.instance.client
-          .from('profiles')
-          .select('is_incognito, incognito_until')
-          .eq('id', currentUserId)
-          .maybeSingle();
-
-      if (userProfile != null) {
-        final isIncognito = userProfile['is_incognito'] as bool? ?? false;
-        if (isIncognito) {
-          final untilStr = userProfile['incognito_until'];
-          if (untilStr != null) {
-            final now = DateTime.now().toUtc();
-            // Ensure explicit UTC parsing
-            String normalized = untilStr;
-            if (!untilStr.endsWith('Z') && !untilStr.contains('+')) {
-              normalized = '${untilStr}Z';
-            }
-            final until = DateTime.parse(normalized).toUtc();
-            if (now.isBefore(until)) {
-              _log(
-                '[proximity] ⚠️ Skipping ping for $handle — '
-                'user incognito mode active (just became active)',
-              );
-              return;
-            }
-          }
-        }
+      if (isIncognito &&
+          incognitoUntil != null &&
+          DateTime.now().toUtc().isBefore(incognitoUntil)) {
+        _log(
+          '[proximity] ⚠️ Skipping ping for $handle — user incognito mode active',
+        );
+        return;
       }
 
       // Canonical pair_key — smaller UUID first so both clients produce the same key.
@@ -667,12 +675,7 @@ class ProximityService {
 
         if (withinCooldown) {
           // Heartbeat active sessions without issuing a new ping.
-          _updateLastSeen(pairKey);
-          _log(
-            '[proximity] Cooldown for $pairKey '
-            '(pinged_at: ${existing['pinged_at']}, '
-            'last_seen_at: ${existing['last_seen_at']})',
-          );
+          _updateLastSeen(pairKey, handle);
           return;
         }
       }
@@ -693,7 +696,7 @@ class ProximityService {
         'triggered_by_user_id': currentUserId,
       }, onConflict: 'pair_key');
 
-      _log('[proximity] Pinged pair $pairKey');
+      _log('[proximity] Pinged @$handle');
 
       // Notify the local user immediately.
       // The friend is notified via APNs (Supabase Edge Function).
@@ -707,16 +710,16 @@ class ProximityService {
   /// Used both during active proximity (checkAndPing) and when cooldown is active (_tryPing).
   /// The DB webhook guard in the Edge Function detects that `pinged_at` is unchanged
   /// and skips the APNs push, so only local session bookkeeping happens.
-  void _updateLastSeen(String pairKey) {
+  void _updateLastSeen(String pairKey, String handle) {
     Supabase.instance.client
         .from('proximity_pings')
         .update({'last_seen_at': DateTime.now().toUtc().toIso8601String()})
         .eq('pair_key', pairKey)
         .then((_) {
-          _log('[proximity] Heartbeat last_seen_at updated for $pairKey');
+          _log('[proximity] still nearby: @$handle (last_seen_at updated)');
         })
         .catchError((Object e) {
-          _log('[proximity] Error updating last_seen_at for $pairKey: $e');
+          _log('[proximity] Error updating last_seen_at for @$handle: $e');
         });
   }
 

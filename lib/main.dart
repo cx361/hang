@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:io' show Platform, File, Directory;
+import 'dart:io' show Platform, File;
 import 'dart:math' show atan2, cos, max, min, pi, sin, sqrt;
 import 'dart:ui' show ImageFilter;
 
@@ -178,7 +178,7 @@ class ActivityClassifier {
         // Sub-classify based on speed
         if (gpsSpeedMs != null && gpsSpeedMs >= 0) {
           if (gpsSpeedMs > 22) {
-            // > 80 km/h
+            // > 80 km/h → highway
             return TransportModeClassification(
               mode: TransportMode.highway,
               primarySource: DataSource.activityRecognition,
@@ -189,7 +189,21 @@ class ActivityClassifier {
               activityType: activityType,
               speedAccuracy: speedAccuracy,
             );
+          } else if (gpsSpeedMs < 6.94) {
+            // < 25 km/h → CoreMotion false-positive; cycling/e-bike is far more
+            // likely than a car crawling at this speed (parking lots aside).
+            return TransportModeClassification(
+              mode: TransportMode.cycling,
+              primarySource: DataSource.activityRecognition,
+              confidence: 0.65,
+              reasoning:
+                  'Activity Recognition: in_vehicle but slow (${(gpsSpeedMs * 3.6).toStringAsFixed(1)} km/h < 25) — likely cycling',
+              speedKmh: gpsSpeedMs * 3.6,
+              activityType: activityType,
+              speedAccuracy: speedAccuracy,
+            );
           } else {
+            // 25–80 km/h → unambiguously a vehicle
             return TransportModeClassification(
               mode: TransportMode.transit,
               primarySource: DataSource.activityRecognition,
@@ -951,7 +965,6 @@ class _RadarTabState extends State<_RadarTab> {
 
   // Debug panel
   final List<String> _debugLog = [];
-  bool _showDebug = false;
 
   // Transport Mode Classification & History
   TransportMode? _currentTransportMode; // Committed mode
@@ -962,13 +975,16 @@ class _RadarTabState extends State<_RadarTab> {
   bg.Location? _lastLocationForDistance; // For distance-based speed calculation
 
   // Set true by onHeartbeat right before its getCurrentPosition() so the
-  // resulting _onLocation bypasses the same-cell guard. While sitting still in
+  // resulting _onLocation bypasses the same-cell guard and logs "heartbeat".
+  // Set true during _startLocationTracking startup so the initial fix logs
+  // "app-start" instead of "location-update". While sitting still in
   // one H3 cell the guard would otherwise skip both the updated_at write and
   // the friend scan — freezing last_seen_at, letting the 3h cooldown lapse, and
   // risking a departure ping after >=3h together. Forcing the scan lets
   // checkAndPing heartbeat last_seen_at (ping stays suppressed) and keeps our
   // updated_at fresh.
   bool _forceScanFromHeartbeat = false;
+  bool _forceScanFromAppStart = false;
 
   void _dbg(String msg) {
     final ts = DateTime.now().toLocal().toString().substring(11, 19);
@@ -976,6 +992,20 @@ class _RadarTabState extends State<_RadarTab> {
     _debugLog.insert(0, '[$ts] $msg');
     if (_debugLog.length > 30) _debugLog.removeLast();
     if (mounted) setState(() {});
+    // Persist meaningful events to native SQLite so they survive 24h across restarts.
+    if (msg.startsWith('🚦')) {
+      bg.Logger.info('[hang] $msg');
+    } else if (msg.startsWith('prox:') &&
+        !msg.contains('channel') &&
+        !msg.contains('RealtimeSubscribeStatus') &&
+        !msg.contains('APNs') &&
+        !msg.contains('perms') &&
+        !msg.contains('permission') &&
+        !msg.contains('Service initialized') &&
+        !msg.contains('initialize result') &&
+        !msg.contains('foreground message suppressed')) {
+      bg.Logger.info('[hang] $msg');
+    }
   }
 
   /// Fetches the plugin's native SQLite log and shows it in a scrollable
@@ -983,45 +1013,62 @@ class _RadarTabState extends State<_RadarTab> {
   /// every app relaunch), this log is written natively even while the app is
   /// backgrounded or terminated. We constrain this view to the last 24 hours.
   Future<String> _getDeviceLogLast24h() async {
-    final end = DateTime.now();
+    final end = DateTime.now().toUtc();
     final start = end.subtract(const Duration(hours: 24));
-    return bg.Logger.getLog(
+    final rawLog = await bg.Logger.getLog(
       bg.SQLQuery(start: start, end: end, order: bg.SQLQuery.ORDER_ASC),
     );
+
+    final lines = rawLog.split('\n');
+    final filtered = lines.where((line) {
+      if (line.trim().isEmpty) return false;
+
+      if (line.contains('distanceFilter')) return true;
+
+      // [hang]-tagged app events — exclude init noise
+      if (line.contains('[hang]')) {
+        if (line.contains('channel') ||
+            line.contains('RealtimeSubscribeStatus') ||
+            line.contains('APNs') ||
+            line.contains('perms') ||
+            line.contains('permission') ||
+            line.contains('Service initialized') ||
+            line.contains('initialize result') ||
+            line.contains('foreground message suppressed')) {
+          return false;
+        }
+        return true;
+      }
+
+      if ((line.contains('ERROR') ||
+              line.contains('error') ||
+              line.contains('failed')) &&
+          !line.contains('finish:error')) {
+        return true;
+      }
+      return false;
+    }).toList();
+
+    return filtered.join('\n');
   }
 
   Future<void> _saveDeviceLogAsText(String log, BuildContext ctx) async {
     try {
-      final now = DateTime.now().toUtc();
-      final yyyy = now.year.toString().padLeft(4, '0');
-      final mm = now.month.toString().padLeft(2, '0');
-      final dd = now.day.toString().padLeft(2, '0');
-      final hh = now.hour.toString().padLeft(2, '0');
-      final min = now.minute.toString().padLeft(2, '0');
-      final ss = now.second.toString().padLeft(2, '0');
-      final stamp = '${yyyy}${mm}${dd}_${hh}${min}${ss}';
-
-      final file = File(
-        '${Directory.systemTemp.path}/hang_device_log_last24h_$stamp.txt',
-      );
-      await file.writeAsString(log);
-
-      await Share.shareXFiles(
-        [XFile(file.path, mimeType: 'text/plain')],
+      final size = MediaQuery.of(ctx).size;
+      await Share.share(
+        log,
         subject: 'hang device log (last 24h)',
-        text: 'hang device log (last 24h)',
+        sharePositionOrigin: Rect.fromCenter(
+          center: Offset(size.width / 2, size.height / 2),
+          width: 100,
+          height: 100,
+        ),
       );
-
-      if (ctx.mounted) {
-        ScaffoldMessenger.of(ctx).showSnackBar(
-          SnackBar(content: Text('Saved as text file: ${file.path}')),
-        );
-      }
     } catch (e) {
       if (ctx.mounted) {
         ScaffoldMessenger.of(
           ctx,
-        ).showSnackBar(SnackBar(content: Text('Failed to save log file: $e')));
+        ).showSnackBar(SnackBar(content: Text('Failed to share log: $e')));
       }
     }
   }
@@ -1520,6 +1567,7 @@ class _RadarTabState extends State<_RadarTab> {
     // Get current position immediately so the stream fires right away.
     // Do NOT call _onLocation directly — the registered stream listener
     // will handle the result, avoiding a double-fire.
+    _forceScanFromAppStart = true;
     try {
       await bg.BackgroundGeolocation.getCurrentPosition(
         desiredAccuracy: bg.Config.DESIRED_ACCURACY_HIGH,
@@ -1601,7 +1649,11 @@ class _RadarTabState extends State<_RadarTab> {
     try {
       cell = h3!.geoToCell(GeoCoord(lat: lat, lon: lng), 9);
       kRingCells = h3!.gridDisk(cell, _visibilityRadius);
-      _dbg('H3 OK: ${cell.toRadixString(16)}');
+      // Persisted entry so every accepted fix shows in the device log with
+      // its sector, accuracy, mode and current distanceFilter.
+      _dbg(
+        'prox: 📍 fix ±${acc.toStringAsFixed(0)}m | sector ${cell.toRadixString(16)} | $mode ${_currentDistanceFilter}m',
+      );
     } catch (e) {
       _dbg('H3 convert error: $e');
       if (mounted) setState(() => statusText = 'H3 error: $e');
@@ -1610,8 +1662,14 @@ class _RadarTabState extends State<_RadarTab> {
 
     // Consume the heartbeat force-scan flag: an hourly heartbeat must refresh
     // updated_at + last_seen_at even without a cell change (see field docs).
-    final forceScan = _forceScanFromHeartbeat;
+    final forceScan = _forceScanFromHeartbeat || _forceScanFromAppStart;
+    final scanSource = _forceScanFromHeartbeat
+        ? 'heartbeat'
+        : _forceScanFromAppStart
+        ? 'app-start'
+        : 'location-update';
     _forceScanFromHeartbeat = false;
+    _forceScanFromAppStart = false;
 
     // Skip if we're already in this cell — avoids duplicate Supabase calls
     // when start(), getCurrentPosition() and a cached event all fire at once.
@@ -1630,6 +1688,9 @@ class _RadarTabState extends State<_RadarTab> {
         statusText = 'Sector calculated';
       });
     }
+
+    // Log what triggered this scan so the device log shows heartbeat vs. location update.
+    _dbg('prox: scan <- $scanSource');
 
     // Update user's location in Supabase immediately (must complete before scanning
     // so is_in_silent_zone is current in both the DB and local state before
@@ -2436,58 +2497,17 @@ class _RadarTabState extends State<_RadarTab> {
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 16),
-              GestureDetector(
-                onTap: () => setState(() => _showDebug = !_showDebug),
-                child: Text(
-                  _showDebug ? 'hide debug ▲' : 'debug ▼',
-                  style: TextStyle(
-                    color: Theme.of(
-                      context,
-                    ).colorScheme.onSurface.withValues(alpha: 0.2),
-                    fontSize: 11,
-                  ),
-                ),
-              ),
-              if (_showDebug)
-                Container(
-                  width: double.infinity,
-                  margin: const EdgeInsets.only(top: 8),
-                  padding: const EdgeInsets.all(10),
-                  decoration: BoxDecoration(
-                    color: Theme.of(context).colorScheme.surface,
-                    border: Border.all(
+              if (Platform.isIOS || Platform.isAndroid)
+                GestureDetector(
+                  onTap: _showDeviceLog,
+                  child: Text(
+                    'debug ▼',
+                    style: TextStyle(
                       color: Theme.of(
                         context,
-                      ).colorScheme.onSurface.withValues(alpha: 0.08),
+                      ).colorScheme.onSurface.withValues(alpha: 0.2),
+                      fontSize: 11,
                     ),
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: _debugLog
-                        .map(
-                          (line) => Text(
-                            line,
-                            style: TextStyle(
-                              fontFamily: 'Courier',
-                              color: Theme.of(
-                                context,
-                              ).colorScheme.onSurface.withValues(alpha: 0.5),
-                              fontSize: 10,
-                              height: 1.5,
-                            ),
-                          ),
-                        )
-                        .toList(),
-                  ),
-                ),
-              if (_showDebug && (Platform.isIOS || Platform.isAndroid))
-                Padding(
-                  padding: const EdgeInsets.only(top: 8),
-                  child: TextButton.icon(
-                    onPressed: _showDeviceLog,
-                    icon: const Icon(Icons.description_outlined, size: 16),
-                    label: const Text('View device log (persisted)'),
                   ),
                 ),
               const SizedBox(height: 8),
